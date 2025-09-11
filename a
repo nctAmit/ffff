@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-# TIN (lon,lat,h) -> Cesium 3D Tiles (.b3dm) with quadtree tiling.
-# Pure Python. No external libs/CLIs. Includes optional wireframe + standalone GLB debug.
+# TIN (lon,lat,height) -> Cesium 3D Tiles (.b3dm) with quadtree tiling.
+# Pure Python. No external tools. Robust traversal & visibility.
+
 import json, os, math, struct
+from collections import deque
 
-# ========================= Tunables =========================
-MAX_TRIANGLES_PER_TILE = 4000
-MAX_DEPTH = 6
-INDEX_UINT_SIZE = 4            # 2 or 4; 4 is safer
-WRITE_B3DM = True              # True = .b3dm; False = .glb tile content (3D Tiles 1.1+)
-WRITE_WIREFRAME_B3DM = True    # ALSO write edges as LINES per tile (debug)
-WRITE_STANDALONE_GLTF = True   # Dump one all-in-one GLB for sanity checks
+# -------------------- Tunables --------------------
+MAX_TRIANGLES_PER_TILE = 4000     # quadtree leaf threshold
+MAX_DEPTH = 6                     # quadtree cap
+WRITE_B3DM = True                 # False => write .glb tile content (3D Tiles 1.1+)
+INDEX_UINT_SIZE = 4               # 2 or 4; 4 is safest
 
+# traversal / culling safety
 REGION_PAD_BOTTOM_M = 5.0
 REGION_PAD_TOP_M = 50.0
 
-# geometricError = max( extent_m * GE_ERROR_SCALE, GE_ERROR_MIN )
-GE_ERROR_SCALE = 0.55          # 0.4–1.0 typical; larger = coarser refinement
-GE_ERROR_MIN = 0.20            # never 0; too-small can make traversal glitchy
+# geometricError = clamp( extent_m * SCALE , MIN )
+GE_SCALE = 0.75                   # 0.5–1.0 typical
+GE_MIN = 0.25                     # never 0; small values block refinement
 
-# ========================= Earth model =======================
+WRITE_WIREFRAME = True            # write LINES content alongside triangles (debug)
+WRITE_STANDALONE_GLBS = True      # write _ALL_TRIANGLES.glb and _ALL_WIREFRAME.glb
+
+# ------------------ Earth model -------------------
 WGS84_A = 6378137.0
 WGS84_B = 6356752.314245
 WGS84_E2 = 1.0 - (WGS84_B*WGS84_B) / (WGS84_A*WGS84_A)
@@ -39,15 +43,13 @@ def ecef_to_enu_rows(lon_deg, lat_deg):
     lon = deg2rad(lon_deg); lat = deg2rad(lat_deg)
     sL, cL = math.sin(lon), math.cos(lon)
     sB, cB = math.sin(lat), math.cos(lat)
-    # Rows (E,N,U) that map ECEF delta -> ENU
     return (
-        (-sL,       cL,       0.0),
-        (-sB*cL,   -sB*sL,    cB),
-        ( cB*cL,    cB*sL,    sB),
+        (-sL,       cL,       0.0),        # E
+        (-sB*cL,   -sB*sL,    cB),         # N
+        ( cB*cL,    cB*sL,    sB),         # U
     )
 
 def enu_to_ecef_transform(lon_deg, lat_deg, origin_ecef):
-    # Column-major 4x4; columns are E,N,U axes in ECEF, plus translation.
     lon = deg2rad(lon_deg); lat = deg2rad(lat_deg)
     sL, cL = math.sin(lon), math.cos(lon)
     sB, cB = math.sin(lat), math.cos(lat)
@@ -62,7 +64,7 @@ def enu_to_ecef_transform(lon_deg, lat_deg, origin_ecef):
         ox, oy, oz, 1.0
     ]
 
-# ========================= Helpers ==========================
+# ------------------ Helpers -----------------------
 def flatten_tin(nested):
     pts = []
     def walk(x):
@@ -72,9 +74,9 @@ def flatten_tin(nested):
             else:
                 for e in x: walk(e)
     walk(nested)
-    if len(pts) % 3: pts[:] = pts[:len(pts)-(len(pts)%3)]
+    if len(pts) % 3: pts = pts[:len(pts) - (len(pts)%3)]
     tris = []
-    for i in range(0,len(pts),3):
+    for i in range(0, len(pts), 3):
         a,b,c = pts[i], pts[i+1], pts[i+2]
         tris.append((a,b,c))
     return tris
@@ -84,13 +86,13 @@ def tri_centroid_lonlat(tri):
     return ((l1+l2+l3)/3.0, (b1+b2+b3)/3.0, (h1+h2+h3)/3.0)
 
 def lonlat_bounds(tris):
-    west=1e9; south=1e9; east=-1e9; north=-1e9; hmin=1e12; hmax=-1e12
+    w=1e9; s=1e9; e=-1e9; n=-1e9; hmin=1e12; hmax=-1e12
     for t in tris:
         for (lon,lat,h) in t:
-            west=min(west,lon); east=max(east,lon)
-            south=min(south,lat); north=max(north,lat)
+            w=min(w,lon); e=max(e,lon)
+            s=min(s,lat); n=max(n,lat)
             hmin=min(hmin,h); hmax=max(hmax,h)
-    return west,south,east,north,hmin,hmax
+    return w,s,e,n,hmin,hmax
 
 def haversine(lon1,lat1,lon2,lat2):
     lon1,lat1,lon2,lat2 = map(deg2rad,(lon1,lat1,lon2,lat2))
@@ -100,8 +102,8 @@ def haversine(lon1,lat1,lon2,lat2):
 
 def ground_extent_meters(w,s,e,n):
     w_m = haversine(w,(s+n)/2, e,(s+n)/2)
-    h_m = haversine((w+e)/2,s, (w+e)/2,n)
-    return max(w_m,h_m)
+    h_m = haversine((w+e)/2, s, (w+e)/2, n)
+    return max(w_m, h_m)
 
 def compute_normals(positions, indices):
     n=len(positions); nx=[0.0]*n; ny=[0.0]*n; nz=[0.0]*n
@@ -124,10 +126,13 @@ def compute_normals(positions, indices):
         out.append((nx[i]/L, ny[i]/L, nz[i]/L))
     return out
 
-# ==================== glTF / GLB builders ===================
+# ----------------- glTF / GLB ---------------------
 def _pad4(b): return b + (b' ' * ((4 - (len(b)%4))%4))
 
-def make_glb_triangles(local_positions, indices, normals=None, mode_triangles=True):
+def make_glb(local_positions, indices, normals=None, mode=4):
+    """
+    mode: 4 = TRIANGLES, 1 = LINES
+    """
     if normals is None:
         normals = compute_normals(local_positions, indices)
 
@@ -137,119 +142,158 @@ def make_glb_triangles(local_positions, indices, normals=None, mode_triangles=Tr
     if INDEX_UINT_SIZE==2:
         maxi = max(indices) if indices else 0
         if maxi>65535: raise ValueError("Use INDEX_UINT_SIZE=4 for large meshes")
-        idx_bytes = b''.join(struct.pack('<H',i) for i in indices)
-        ctype = 5123
+        idx_bytes = b''.join(struct.pack('<H', i) for i in indices)
+        ctype = 5123  # UNSIGNED_SHORT
     else:
-        idx_bytes = b''.join(struct.pack('<I',i) for i in indices)
-        ctype = 5125
+        idx_bytes = b''.join(struct.pack('<I', i) for i in indices)
+        ctype = 5125  # UNSIGNED_INT
 
     bin_data = pos_bytes + nor_bytes + idx_bytes
 
     bufferViews=[]; accessors=[]
-    def accessor(count, type_str, comp, off, bytelen, minmax=None):
-        d={"bufferView":len(bufferViews),"byteOffset":0,"componentType":comp,"count":count,"type":type_str}
-        if minmax: d.update(minmax)
-        bufferViews.append({"buffer":0,"byteOffset":off,"byteLength":bytelen})
-        return d
+    def add_bv(off, length, target):
+        bufferViews.append({"buffer":0,"byteOffset":off,"byteLength":length,"target":target})
+        return len(bufferViews)-1
 
-    off_pos=0
-    a_pos = accessor(len(local_positions),"VEC3",5126,off_pos,len(pos_bytes),
-        {"min":[min(p[i] for p in local_positions) for i in range(3)],
-         "max":[max(p[i] for p in local_positions) for i in range(3)]})
-    accessors.append(a_pos)
+    # positions
+    off_pos = 0
+    bv_pos = add_bv(off_pos, len(pos_bytes), 34962)   # ARRAY_BUFFER
+    accessors.append({
+        "bufferView": bv_pos, "byteOffset": 0, "componentType": 5126, "count": len(local_positions), "type":"VEC3",
+        "min":[min(p[i] for p in local_positions) for i in range(3)],
+        "max":[max(p[i] for p in local_positions) for i in range(3)],
+    })
+
+    # normals
     off_nor = off_pos + len(pos_bytes)
-    a_nor = accessor(len(normals),"VEC3",5126,off_nor,len(nor_bytes))
-    accessors.append(a_nor)
-    off_idx = off_nor + len(nor_bytes)
-    a_idx = accessor(len(indices),"SCALAR",ctype,off_idx,len(idx_bytes))
-    accessors.append(a_idx)
+    bv_nor = add_bv(off_nor, len(nor_bytes), 34962)
+    accessors.append({
+        "bufferView": bv_nor, "byteOffset": 0, "componentType": 5126, "count": len(normals), "type":"VEC3"
+    })
 
-    prim = {
-        "attributes":{"POSITION":0,"NORMAL":1},
-        "indices":2,
-        "mode": 4 if mode_triangles else 1,   # 4=TRIANGLES, 1=LINES
-        "material":0
-    }
+    # indices
+    off_idx = off_nor + len(nor_bytes)
+    bv_idx = add_bv(off_idx, len(idx_bytes), 34963)   # ELEMENT_ARRAY_BUFFER
+    accessors.append({
+        "bufferView": bv_idx, "byteOffset": 0, "componentType": ctype, "count": len(indices), "type":"SCALAR"
+    })
 
     gltf = {
         "asset":{"version":"2.0"},
-        "buffers":[{"byteLength":len(bin_data)}],
-        "bufferViews":bufferViews,
-        "accessors":accessors,
+        "buffers":[{"byteLength": len(bin_data)}],
+        "bufferViews": bufferViews,
+        "accessors": accessors,
         "materials":[{
             "doubleSided": True,
-            "pbrMetallicRoughness":{
-                "baseColorFactor":[0.85,0.85,0.85,1.0],
-                "metallicFactor":0.0,
-                "roughnessFactor":1.0
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [0.87,0.87,0.87,1.0],
+                "metallicFactor": 0.0,
+                "roughnessFactor": 1.0
             }
         }],
-        "meshes":[{"primitives":[prim]}],
+        "meshes":[{"primitives":[{
+            "attributes":{"POSITION":0,"NORMAL":1},
+            "indices":2, "mode": mode, "material":0
+        }]}],
         "nodes":[{"mesh":0}],
         "scenes":[{"nodes":[0]}],
         "scene":0
     }
 
-    gltf_json = json.dumps(gltf,separators=(',',':')).encode('utf-8')
+    gltf_json = json.dumps(gltf, separators=(',',':')).encode('utf-8')
     gltf_json_padded = _pad4(gltf_json)
     bin_padded = _pad4(bin_data)
     total_len = 12 + 8 + len(gltf_json_padded) + 8 + len(bin_padded)
 
     glb = []
-    glb.append(struct.pack('<I',0x46546C67)) # 'glTF'
+    glb.append(struct.pack('<I',0x46546C67))  # 'glTF'
     glb.append(struct.pack('<I',2))
     glb.append(struct.pack('<I',total_len))
     glb.append(struct.pack('<I',len(gltf_json_padded)))
-    glb.append(struct.pack('<I',0x4E4F534A)) # 'JSON'
+    glb.append(struct.pack('<I',0x4E4F534A))  # 'JSON'
     glb.append(gltf_json_padded)
     glb.append(struct.pack('<I',len(bin_padded)))
-    glb.append(struct.pack('<I',0x004E4942)) # 'BIN\0'
+    glb.append(struct.pack('<I',0x004E4942))  # 'BIN\0'
     glb.append(bin_padded)
     return b''.join(glb)
 
 def wrap_b3dm(glb_bytes, feature_table_json=None, batch_table_json=None):
-    if feature_table_json is None: feature_table_json={"BATCH_LENGTH":0}
-    ft = json.dumps(feature_table_json,separators=(',',':')).encode('utf-8')
-    bt = json.dumps(batch_table_json or {},separators=(',',':')).encode('utf-8')
+    if feature_table_json is None:
+        feature_table_json = {"BATCH_LENGTH": 0}
+    ft = json.dumps(feature_table_json, separators=(',',':')).encode('utf-8')
+    bt = json.dumps(batch_table_json or {}, separators=(',',':')).encode('utf-8')
     ftb=_pad4(ft); btb=_pad4(bt)
     header_len=28
     byteLength = header_len + len(ftb) + len(btb) + len(glb_bytes)
     header = struct.pack('<4sIIIIII', b'b3dm', 1, byteLength, len(ftb), 0, len(btb), 0)
     return header + ftb + btb + glb_bytes
 
-# ===================== Quadtree & writer ====================
-class QuadNode:
-    __slots__=("w","s","e","n","d","tris","child","id")
-    def __init__(self,w,s,e,n,d,id_):
+# ----------------- Quadtree -----------------------
+class Node:
+    __slots__=("w","s","e","n","d","id","tris","kids","tri_count_subtree")
+    def __init__(self, w,s,e,n, d, id_):
         self.w=w; self.s=s; self.e=e; self.n=n
         self.d=d; self.id=id_
-        self.tris=[]; self.child=None
+        self.tris=[]; self.kids=None
+        self.tri_count_subtree=0
 
-def subdivide(node, max_tris, max_depth):
-    if node.d>=max_depth or len(node.tris)<=max_tris: return
-    w,s,e,n = node.w,node.s,node.e,node.n
-    cx=(w+e)/2; cy=(s+n)/2
-    quads=[
-        QuadNode(w,cy,cx,n,node.d+1,node.id+"0"), # NW
-        QuadNode(cx,cy,e,n,node.d+1,node.id+"1"), # NE
-        QuadNode(w,s,cx,cy,node.d+1,node.id+"2"), # SW
-        QuadNode(cx,s,e,cy,node.d+1,node.id+"3"), # SE
-    ]
-    bins=[[],[],[],[]]
-    for tri in node.tris:
-        clon,clat,_=tri_centroid_lonlat(tri)
-        idx = (0 if clat>=cy and clon<cx else
-               1 if clat>=cy and clon>=cx else
-               2 if clat<cy  and clon<cx else 3)
-        bins[idx].append(tri)
-    for i,q in enumerate(quads): q.tris=bins[i]
-    node.child=quads; node.tris=[]
-    for ch in quads: subdivide(ch,max_tris,max_depth)
+def subdivide(root, max_tris, max_depth):
+    q = deque([root])
+    while q:
+        node = q.popleft()
+        if node.d >= max_depth or len(node.tris) <= max_tris:
+            continue
+        w,s,e,n = node.w,node.s,node.e,node.n
+        cx=(w+e)/2.0; cy=(s+n)/2.0
+        kids = [
+            Node(w, cy, cx, n, node.d+1, node.id+"0"), # NW
+            Node(cx,cy, e, n, node.d+1, node.id+"1"),  # NE
+            Node(w, s, cx, cy, node.d+1, node.id+"2"), # SW
+            Node(cx,s, e, cy, node.d+1, node.id+"3"),  # SE
+        ]
+        bins=[[],[],[],[]]
+        for tri in node.tris:
+            clon,clat,_ = tri_centroid_lonlat(tri)
+            idx = (0 if clat>=cy and clon<cx else
+                   1 if clat>=cy and clon>=cx else
+                   2 if clat<cy  and clon<cx else 3)
+            bins[idx].append(tri)
+        for i,k in enumerate(kids): k.tris = bins[i]
+        node.kids = kids
+        node.tris = []
+        q.extend(kids)
 
-def _build_tile_mesh(triangles, lon0, lat0, origin_ecef):
-    R = ecef_to_enu_rows(lon0,lat0)
-    verts=[]; vindex={}; idx=[]
-    edges=set()  # for wireframe
+    # populate subtree triangle counts
+    def count_tris(n: Node):
+        if n.kids is None:
+            n.tri_count_subtree = len(n.tris)
+        else:
+            total = 0
+            for k in n.kids:
+                total += count_tris(k)
+            n.tri_count_subtree = total
+        return n.tri_count_subtree
+    count_tris(root)
+
+def sample_from_subtree(node: Node, limit: int):
+    """Collect up to 'limit' triangles from leaves in this subtree."""
+    out=[]; stack=[node]
+    while stack and len(out)<limit:
+        cur = stack.pop()
+        if cur.kids is None:
+            if cur.tris:
+                step=max(1, len(cur.tris) // max(1, limit // 4))
+                out.extend(cur.tris[::step])
+        else:
+            # push larger subtrees first
+            ks = sorted(cur.kids, key=lambda k: k.tri_count_subtree, reverse=True)
+            stack.extend(ks)
+    return out[:limit]
+
+# -------------- Mesh builders / writers -----------
+def build_local_mesh(tris, lon0, lat0, origin_ecef):
+    R = ecef_to_enu_rows(lon0, lat0)
+    verts=[]; vmap={}; idx=[]; edges=set()
     def to_enu(lon,lat,h):
         pe=geodetic_to_ecef(lon,lat,h)
         dx=pe[0]-origin_ecef[0]; dy=pe[1]-origin_ecef[1]; dz=pe[2]-origin_ecef[2]
@@ -258,198 +302,158 @@ def _build_tile_mesh(triangles, lon0, lat0, origin_ecef):
         uz = R[2][0]*dx + R[2][1]*dy + R[2][2]*dz
         return (ex,ny,uz)
     def add_v(v):
-        if v in vindex:
-            return vindex[v]
-        p=to_enu(*v)
-        i=len(verts); verts.append(p); vindex[v]=i; return i
-    for a,b,c in triangles:
+        if v in vmap: return vmap[v]
+        p = to_enu(*v); i=len(verts); verts.append(p); vmap[v]=i; return i
+    for a,b,c in tris:
         i0=add_v(a); i1=add_v(b); i2=add_v(c)
-        # ENU up is +Z, enforce CCW (face up)
+        # CCW in ENU (z-up): ensure +Z normal
         x0,y0,z0=verts[i0]; x1,y1,z1=verts[i1]; x2,y2,z2=verts[i2]
         ux,uy,uz=(x1-x0,y1-y0,z1-z0); vx,vy,vz=(x2-x0,y2-y0,z2-z0)
-        nz = ux*vy - uy*vx
-        if nz<0: i1,i2=i2,i1
+        fz = ux*vy - uy*vx
+        if fz < 0.0:
+            i1,i2 = i2,i1
         idx.extend([i0,i1,i2])
-        # edges (undirected)
         e0=tuple(sorted((i0,i1))); e1=tuple(sorted((i1,i2))); e2=tuple(sorted((i2,i0)))
         edges.add(e0); edges.add(e1); edges.add(e2)
-    # build line index list for wireframe
-    line_idx=[]
+    # line indices for wireframe
+    lines=[]
     for a,b in edges:
-        line_idx.append(a); line_idx.append(b)
-    return verts, idx, line_idx
+        lines.extend([a,b])
+    return verts, idx, lines
 
-def write_tile_contents(tile_dir, node, triangles, add_wireframe):
-    if not triangles: return None
+def write_tile_files(tile_dir, node: Node, tris, add_wire):
+    if not tris: return None
     w,s,e,n = node.w,node.s,node.e,node.n
-    lon0=(w+e)/2; lat0=(s+n)/2
-    # median height as local origin height
-    hs=[h for t in triangles for (_,_,h) in t]
+    lon0=(w+e)/2.0; lat0=(s+n)/2.0
+    hs=[h for t in tris for (_,_,h) in t]
     h0 = sorted(hs)[len(hs)//2] if hs else 0.0
 
-    origin_ecef = geodetic_to_ecef(lon0,lat0,h0)
-    verts, tri_idx, line_idx = _build_tile_mesh(triangles, lon0, lat0, origin_ecef)
+    origin_ecef = geodetic_to_ecef(lon0, lat0, h0)
+    verts, tri_idx, line_idx = build_local_mesh(tris, lon0, lat0, origin_ecef)
 
-    # --- triangles content
-    glb_tri = make_glb_triangles(verts, tri_idx, normals=None, mode_triangles=True)
+    glb_tri = make_glb(verts, tri_idx, normals=None, mode=4)
     if WRITE_B3DM:
-        content_tri = wrap_b3dm(glb_tri); ext=".b3dm"
+        payload = wrap_b3dm(glb_tri); ext=".b3dm"
     else:
-        content_tri = glb_tri; ext=".glb"
-    fname_tri = f"tile_{node.id or 'root'}{ext}"
-    with open(os.path.join(tile_dir,fname_tri),"wb") as f: f.write(content_tri)
+        payload = glb_tri; ext=".glb"
+    fname = f"tile_{node.id or 'root'}{ext}"
+    with open(os.path.join(tile_dir, fname), "wb") as f: f.write(payload)
 
-    # --- optional wireframe content (separate file with LINES)
-    fname_wire=None
-    if add_wireframe and line_idx:
-        glb_lin = make_glb_triangles(verts, line_idx, normals=[(0,0,1)]*len(verts), mode_triangles=False)
-        if WRITE_B3DM: content_lin = wrap_b3dm(glb_lin)
-        else: content_lin = glb_lin
-        fname_wire = f"tile_{node.id or 'root'}_wire{ext}"
-        with open(os.path.join(tile_dir,fname_wire),"wb") as f: f.write(content_lin)
+    wire_uri = None
+    if add_wire and line_idx:
+        glb_lin = make_glb(verts, line_idx, normals=[(0,0,1)]*len(verts), mode=1)
+        wire_payload = wrap_b3dm(glb_lin) if WRITE_B3DM else glb_lin
+        wire_uri = f"tile_{node.id or 'root'}_wire{ext}"
+        with open(os.path.join(tile_dir, wire_uri), "wb") as f: f.write(wire_payload)
 
-    # bounding region
-    west_r,south_r,east_r,north_r = map(deg2rad,(w,s,e,n))
+    west_r,south_r,east_r,north_r = map(deg2rad, (w,s,e,n))
     hmin_p = (min(hs) if hs else h0) - REGION_PAD_BOTTOM_M
     hmax_p = (max(hs) if hs else h0) + REGION_PAD_TOP_M
-
     extent_m = max(ground_extent_meters(w,s,e,n), 1.0)
-    ge = max(extent_m*GE_ERROR_SCALE, GE_ERROR_MIN)
+    ge = max(extent_m * GE_SCALE, GE_MIN)
 
     return {
-        "uri_tri": fname_tri,
-        "uri_wire": fname_wire,
+        "uri": fname,
+        "wire_uri": wire_uri,
         "transform": enu_to_ecef_transform(lon0,lat0,origin_ecef),
         "region": [west_r,south_r,east_r,north_r,hmin_p,hmax_p],
-        "geometricError": ge
+        "ge": ge
     }
 
-def build_tileset(root_node, out_dir):
-    tiles_dir = os.path.join(out_dir,"tiles"); os.makedirs(tiles_dir,exist_ok=True)
+def build_tileset(root: Node, out_dir):
+    tiles_dir = os.path.join(out_dir, "tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
 
-    def make_node_json(node):
-        is_leaf = (node.child is None)
-        if is_leaf:
-            info = write_tile_contents(tiles_dir, node, node.tris, add_wireframe=WRITE_WIREFRAME_B3DM)
-            if info is None:
-                # empty leaf
-                region=[*map(deg2rad,(node.w,node.s,node.e,node.n)),0.0,10.0]
-                return {"boundingVolume":{"region":region},"geometricError":GE_ERROR_MIN,"refine":"REPLACE"}
-            entry = {
-                "boundingVolume":{"region":info["region"]},
-                "geometricError": max(info["geometricError"]*0.25, GE_ERROR_MIN),
+    def build_json(node: Node):
+        # choose content tris for this node
+        if node.kids is None:
+            tris_here = node.tris
+        else:
+            # internal node: always sample from subtree (guaranteed non-empty if subtree has tris)
+            want = max(100, min(5000, node.tri_count_subtree // 10 or 100))
+            tris_here = sample_from_subtree(node, want)
+
+        info = write_tile_files(tiles_dir, node, tris_here, add_wire=WRITE_WIREFRAME)
+        # fallback empty (rare)
+        if info is None:
+            region=[*map(deg2rad,(node.w,node.s,node.e,node.n)), 0.0, 10.0]
+            ge_here = max(ground_extent_meters(node.w,node.s,node.e,node.n) * GE_SCALE, GE_MIN)
+            out = {"boundingVolume":{"region":region}, "geometricError": ge_here, "refine":"REPLACE"}
+        else:
+            out = {
+                "boundingVolume":{"region": info["region"]},
+                "geometricError": max(info["ge"], GE_MIN),
                 "refine":"REPLACE",
                 "transform": info["transform"],
-                "content":{"uri":"tiles/"+info["uri_tri"]}
+                "content":{"uri":"tiles/"+info["uri"]}
             }
-            # add second content as an optional child node for wireframe (so you can toggle by loading another tileset)
-            if info["uri_wire"]:
-                entry.setdefault("children",[]).append({
-                    "boundingVolume":{"region":info["region"]},
-                    "geometricError": GE_ERROR_MIN,
+            if info["wire_uri"]:
+                out.setdefault("children", []).append({
+                    "boundingVolume":{"region": info["region"]},
+                    "geometricError": GE_MIN,
                     "refine":"REPLACE",
                     "transform": info["transform"],
-                    "content":{"uri":"tiles/"+info["uri_wire"]}
+                    "content":{"uri":"tiles/"+info["wire_uri"]}
                 })
-            return entry
 
-        # internal
-        sample=[]
-        for ch in node.child:
-            if ch.tris:
-                step=max(1,len(ch.tris)//12)
-                sample.extend(ch.tris[::step])
-        info = write_tile_contents(tiles_dir, node, sample, add_wireframe=False) if sample else None
+        # children
+        if node.kids:
+            kids_json = [build_json(k) for k in node.kids]
+            out.setdefault("children", []).extend(kids_json)
 
-        extent_m = max(ground_extent_meters(node.w,node.s,node.e,node.n),1.0)
-        node_ge = max(extent_m*GE_ERROR_SCALE, GE_ERROR_MIN)
-        children=[make_node_json(ch) for ch in node.child]
-        out = {
-            "boundingVolume":{"region":[*map(deg2rad,(node.w,node.s,node.e,node.n)),0.0,1000.0]},
-            "geometricError": node_ge,
-            "refine":"REPLACE",
-            "children": children
-        }
-        if info:
-            out["content"]={"uri":"tiles/"+info["uri_tri"]}
-            out["transform"]=info["transform"]
-            out["boundingVolume"]={"region":info["region"]}
-            out["geometricError"]=max(info["geometricError"], node_ge)
+            # keep parent GE ≥ max(child GE)
+            max_child_ge = max(k.get("geometricError", GE_MIN) for k in kids_json)
+            out["geometricError"] = max(out["geometricError"], max_child_ge)
+
         return out
 
-    root_json = make_node_json(root_node)
+    root_json = build_json(root)
+    root_extent_m = max(ground_extent_meters(root.w,root.s,root.e,root.n), 1.0)
     tileset = {
         "asset":{"version":"1.0"},
-        "geometricError": max(ground_extent_meters(root_node.w,root_node.s,root_node.e,root_node.n)*GE_ERROR_SCALE, GE_ERROR_MIN),
+        "geometricError": max(root_extent_m * GE_SCALE, GE_MIN),
         "root": root_json
     }
-    with open(os.path.join(out_dir,"tileset.json"),"w",encoding="utf-8") as f:
-        json.dump(tileset,f,separators=(',',':'))
+    with open(os.path.join(out_dir, "tileset.json"), "w", encoding="utf-8") as f:
+        json.dump(tileset, f, separators=(',',':'))
     return tileset
 
-# ====================== Public API / Main ===================
-def tin_to_3dtiles(tin_nested, output_dir, max_tris=MAX_TRIANGLES_PER_TILE, max_depth=MAX_DEPTH):
-    os.makedirs(output_dir,exist_ok=True)
+# ----------------- Public API / Main ---------------
+def tin_to_3dtiles(tin_nested, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
     tris = flatten_tin(tin_nested)
-    if not tris: raise ValueError("No triangles parsed from input.")
-    w,s,e,n,hmin,hmax = lonlat_bounds(tris)
-    root = QuadNode(w,s,e,n,0,"")
-    root.tris=tris
-    subdivide(root, max_tris, max_depth)
+    if not tris:
+        raise ValueError("No triangles parsed from input.")
 
-    # Optional: dump one standalone GLB of the entire mesh for sanity
-    if WRITE_STANDALONE_GLTF:
-        lon0=(w+e)/2; lat0=(s+n)/2
-        hs=[h for t in tris for (_,_,h) in t]; h0=sorted(hs)[len(hs)//2] if hs else 0.0
+    w,s,e,n,hmin,hmax = lonlat_bounds(tris)
+    root = Node(w,s,e,n, 0, "")
+    root.tris = tris
+    subdivide(root, MAX_TRIANGLES_PER_TILE, MAX_DEPTH)
+
+    # dump standalone GLBs (sanity) from full mesh at area center
+    if WRITE_STANDALONE_GLBS:
+        lon0=(w+e)/2.0; lat0=(s+n)/2.0
+        hs=[h for t in tris for (_,_,h) in t]; h0 = sorted(hs)[len(hs)//2] if hs else 0.0
         origin_ecef=geodetic_to_ecef(lon0,lat0,h0)
-        verts, tri_idx, line_idx = _build_tile_mesh(tris, lon0, lat0, origin_ecef)
-        glb_all = make_glb_triangles(verts, tri_idx, normals=None, mode_triangles=True)
-        with open(os.path.join(output_dir,"_ALL_TRIANGLES.glb"),"wb") as f: f.write(glb_all)
-        glb_wire = make_glb_triangles(verts, line_idx, normals=[(0,0,1)]*len(verts), mode_triangles=False)
-        with open(os.path.join(output_dir,"_ALL_WIREFRAME.glb"),"wb") as f: f.write(glb_wire)
+        verts, tri_idx, line_idx = build_local_mesh(tris, lon0, lat0, origin_ecef)
+        glb_tri = make_glb(verts, tri_idx, normals=None, mode=4)
+        with open(os.path.join(output_dir,"_ALL_TRIANGLES.glb"),"wb") as f: f.write(glb_tri)
+        glb_lin = make_glb(verts, line_idx, normals=[(0,0,1)]*len(verts), mode=1)
+        with open(os.path.join(output_dir,"_ALL_WIREFRAME.glb"),"wb") as f: f.write(glb_lin)
 
     return build_tileset(root, output_dir)
 
-if __name__=="__main__":
-    # ======= Replace with your real TIN data =======
+# --------------- Example run -----------------------
+if __name__ == "__main__":
+    # Replace this with your real nested TIN data
     TIN_DATA = [
         [[[77.2090, 28.6139, 230.0], [77.2095, 28.6142, 232.0], [77.2086, 28.6140, 231.0]]],
         [[[77.2096, 28.6145, 233.0], [77.2090, 28.6139, 230.0], [77.2100, 28.6142, 229.0]]]
     ]
     OUTPUT_DIR = "./tin_tiles_out"
     tileset = tin_to_3dtiles(TIN_DATA, OUTPUT_DIR)
-    print("Wrote:", os.path.abspath(os.path.join(OUTPUT_DIR,"tileset.json")))
-    print("Tiles:", os.path.abspath(os.path.join(OUTPUT_DIR,"tiles")))
-    if WRITE_STANDALONE_GLTF:
+    print("Wrote:", os.path.abspath(os.path.join(OUTPUT_DIR, "tileset.json")))
+    print("Tiles:", os.path.abspath(os.path.join(OUTPUT_DIR, "tiles")))
+    if WRITE_STANDALONE_GLBS:
         print("Debug GLBs:", os.path.abspath(os.path.join(OUTPUT_DIR,"_ALL_TRIANGLES.glb")),
               os.path.abspath(os.path.join(OUTPUT_DIR,"_ALL_WIREFRAME.glb")))
-
-
-
-
-
-
-
-
-// 1) While validating:
-viewer.scene.globe.depthTestAgainstTerrain = false;
-
-// 2) Load tiles:
-const tileset = await Cesium.Cesium3DTileset.fromUrl('/path/to/tin_tiles_out/tileset.json');
-viewer.scene.primitives.add(tileset);
-await tileset.readyPromise;
-viewer.zoomTo(tileset);
-tileset.debugShowBoundingVolume = true;
-tileset.debugColorizeTiles = true;
-viewer.scene.requestRender();
-
-// 3) If still “nothing”: load the standalone GLB directly (bypasses 3D Tiles)
-const model = await Cesium.Model.fromGltfAsync({
-  url: '/path/to/tin_tiles_out/_ALL_TRIANGLES.glb',
-  modelMatrix: Cesium.Transforms.eastNorthUpToFixedFrame(
-    Cesium.Cartesian3.fromDegrees( (west+east)/2, (south+north)/2, 0 ) // rough; it’s already ENU-origin-converted
-  )
-});
-viewer.scene.primitives.add(model);
-viewer.zoomTo(model);
-
