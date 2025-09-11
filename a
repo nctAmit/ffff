@@ -1,459 +1,467 @@
-#!/usr/bin/env python3
-# TIN (lon,lat,height) -> Cesium 3D Tiles (.b3dm) with quadtree tiling.
-# Pure Python. No external tools. Robust traversal & visibility.
 
-import json, os, math, struct
-from collections import deque
 
-# -------------------- Tunables --------------------
-MAX_TRIANGLES_PER_TILE = 4000     # quadtree leaf threshold
-MAX_DEPTH = 6                     # quadtree cap
-WRITE_B3DM = True                 # False => write .glb tile content (3D Tiles 1.1+)
-INDEX_UINT_SIZE = 4               # 2 or 4; 4 is safest
 
-# traversal / culling safety
-REGION_PAD_BOTTOM_M = 5.0
-REGION_PAD_TOP_M = 50.0
 
-# geometricError = clamp( extent_m * SCALE , MIN )
-GE_SCALE = 0.75                   # 0.5–1.0 typical
-GE_MIN = 0.25                     # never 0; small values block refinement
 
-WRITE_WIREFRAME = True            # write LINES content alongside triangles (debug)
-WRITE_STANDALONE_GLBS = True      # write _ALL_TRIANGLES.glb and _ALL_WIREFRAME.glb
+# Output root
+OUT_DIR = "out_tileset"
+TILES_DIR = "tiles"  # nested folders here
+ROOT_TILE_FILENAME = "tileset.json"
 
-# ------------------ Earth model -------------------
-WGS84_A = 6378137.0
-WGS84_B = 6356752.314245
-WGS84_E2 = 1.0 - (WGS84_B*WGS84_B) / (WGS84_A*WGS84_A)
-EARTH_RADIUS_MEAN = 6371008.8
+# Tiling params
+MAX_TRIS_PER_TILE = 400   # stop splitting when <= this many tris
+MAX_DEPTH = 8             # hard limit of quadtree depth
 
-def deg2rad(d): return d * math.pi / 180.0
+# CRS settings
+INPUT_EPSG = 3857
+WGS84_EPSG = 4326
+ECEF_EPSG = 4978
 
-def geodetic_to_ecef(lon_deg, lat_deg, h):
-    lon = deg2rad(lon_deg); lat = deg2rad(lat_deg)
-    cos_lat = math.cos(lat); sin_lat = math.sin(lat)
-    N = WGS84_A / math.sqrt(1.0 - WGS84_E2 * sin_lat*sin_lat)
-    x = (N + h) * cos_lat * math.cos(lon)
-    y = (N + h) * cos_lat * math.sin(lon)
-    z = (N*(1.0 - WGS84_E2) + h) * sin_lat
-    return (x, y, z)
+def enu_axes(lon: float, lat: float):
+    lam, phi = math.radians(lon), math.radians(lat)
+    sinl, cosl = math.sin(lam), math.cos(lam)
+    sinp, cosp = math.sin(phi), math.cos(phi)
+    E = (-sinl,  cosl, 0.0)
+    N = (-sinp * cosl, -sinp * sinl, cosp)
+    U = ( cosp * cosl,  cosp * sinl, sinp)
+    return E, N, U
 
-def ecef_to_enu_rows(lon_deg, lat_deg):
-    lon = deg2rad(lon_deg); lat = deg2rad(lat_deg)
-    sL, cL = math.sin(lon), math.cos(lon)
-    sB, cB = math.sin(lat), math.cos(lat)
-    return (
-        (-sL,       cL,       0.0),        # E
-        (-sB*cL,   -sB*sL,    cB),         # N
-        ( cB*cL,    cB*sL,    sB),         # U
+def proj_xy_to_lonlat(x: float, y: float) -> Tuple[float, float]:
+    tr = Transformer.from_crs(f"EPSG:{INPUT_EPSG}", f"EPSG:{WGS84_EPSG}", always_xy=True)
+    return tr.transform(x, y)
+
+
+def enu_to_ecef_transform(lon: float, lat: float, h: float) -> List[float]:
+    # Local basis in ECEF
+    (ex, ey, ez), (nx, ny, nz), (ux, uy, uz) = enu_axes(lon, lat)
+    # TILE FRAME: X=E, Y=N, Z=U  (Z-up)
+    col0 = (ex, ey, ez)   # X -> East
+    col1 = (nx, ny, nz)   # Y -> North
+    col2 = (ux, uy, uz)   # Z -> Up
+    X0, Y0, Z0 = (
+        Transformer.from_crs(f"EPSG:{WGS84_EPSG}", f"EPSG:{ECEF_EPSG}", always_xy=True)
+        .transform(lon, lat, h)
     )
 
-def enu_to_ecef_transform(lon_deg, lat_deg, origin_ecef):
-    lon = deg2rad(lon_deg); lat = deg2rad(lat_deg)
-    sL, cL = math.sin(lon), math.cos(lon)
-    sB, cB = math.sin(lat), math.cos(lat)
-    Ex, Ey, Ez = -sL,        cL,       0.0
-    Nx, Ny, Nz = -sB*cL,    -sB*sL,    cB
-    Ux, Uy, Uz =  cB*cL,     cB*sL,    sB
-    ox, oy, oz = origin_ecef
+    # Column-major 4x4
     return [
-        Ex, Nx, Ux, 0.0,
-        Ey, Ny, Uy, 0.0,
-        Ez, Nz, Uz, 0.0,
-        ox, oy, oz, 1.0
+        col0[0], col0[1], col0[2], 0.0,
+        col1[0], col1[1], col1[2], 0.0,
+        col2[0], col2[1], col2[2], 0.0,
+        X0,      Y0,      Z0,      1.0
     ]
 
-# ------------------ Helpers -----------------------
-def flatten_tin(nested):
-    pts = []
-    def walk(x):
-        if isinstance(x, (list, tuple)):
-            if len(x)==3 and all(isinstance(v,(int,float)) for v in x):
-                pts.append((float(x[0]), float(x[1]), float(x[2])))
-            else:
-                for e in x: walk(e)
-    walk(nested)
-    if len(pts) % 3: pts = pts[:len(pts) - (len(pts)%3)]
+
+# ---------- TIN -> triangles ----------
+def triangle_area_xy(tri):
+    (x1,y1,_),(x2,y2,_),(x3,y3,_) = tri
+    return abs(0.5*((x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)))
+
+def parse_tin_to_triangles(tin: Any) -> List[List[Tuple[float,float,float]]]:
     tris = []
-    for i in range(0, len(pts), 3):
-        a,b,c = pts[i], pts[i+1], pts[i+2]
-        tris.append((a,b,c))
+    def clean_ring(ring):
+        out=[]; last=None
+        for p in ring:
+            t=(float(p[0]), float(p[1]), float(p[2]))
+            if last is None or t!=last:
+                out.append(t); last=t
+        if len(out)>=2 and out[0]==out[-1]:
+            out.pop()
+        return out
+    def walk(node):
+        if not isinstance(node, list): return
+        if len(node)>0 and isinstance(node[0], (list,tuple)) and len(node[0])>=3 and isinstance(node[0][0], (float,int)):
+            ring=clean_ring(node)
+            if len(ring)>=3:
+                for i in range(1,len(ring)-1):
+                    tri=[ring[0], ring[i], ring[i+1]]
+                    if triangle_area_xy(tri)>0: tris.append(tri)
+            return
+        for c in node: walk(c)
+    walk(tin)
     return tris
 
-def tri_centroid_lonlat(tri):
-    (l1,b1,h1),(l2,b2,h2),(l3,b3,h3) = tri
-    return ((l1+l2+l3)/3.0, (b1+b2+b3)/3.0, (h1+h2+h3)/3.0)
-
-def lonlat_bounds(tris):
-    w=1e9; s=1e9; e=-1e9; n=-1e9; hmin=1e12; hmax=-1e12
+# ---------- Mesh helpers ----------
+def build_indexed_mesh(tris):
+    vmap: Dict[Tuple[float,float,float], int] = {}
+    verts: List[Tuple[float,float,float]] = []
+    faces: List[Tuple[int,int,int]] = []
+    def add_v(p):
+        idx = vmap.get(p)
+        if idx is None:
+            idx=len(verts); verts.append(p); vmap[p]=idx
+        return idx
     for t in tris:
-        for (lon,lat,h) in t:
-            w=min(w,lon); e=max(e,lon)
-            s=min(s,lat); n=max(n,lat)
-            hmin=min(hmin,h); hmax=max(hmax,h)
-    return w,s,e,n,hmin,hmax
+        i0=add_v(t[0]); i1=add_v(t[1]); i2=add_v(t[2])
+        if len({i0,i1,i2})==3:
+            faces.append((i0,i1,i2))
+    return verts, faces
 
-def haversine(lon1,lat1,lon2,lat2):
-    lon1,lat1,lon2,lat2 = map(deg2rad,(lon1,lat1,lon2,lat2))
-    dlon=lon2-lon1; dlat=lat2-lat1
-    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-    return 2*EARTH_RADIUS_MEAN*math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-def ground_extent_meters(w,s,e,n):
-    w_m = haversine(w,(s+n)/2, e,(s+n)/2)
-    h_m = haversine((w+e)/2, s, (w+e)/2, n)
-    return max(w_m, h_m)
-
-def compute_normals(positions, indices):
-    n=len(positions); nx=[0.0]*n; ny=[0.0]*n; nz=[0.0]*n
-    for i in range(0,len(indices),3):
-        i0,i1,i2 = indices[i],indices[i+1],indices[i+2]
-        x0,y0,z0 = positions[i0]
-        x1,y1,z1 = positions[i1]
-        x2,y2,z2 = positions[i2]
-        ux,uy,uz = (x1-x0,y1-y0,z1-z0)
-        vx,vy,vz = (x2-x0,y2-y0,z2-z0)
-        fx = uy*vz - uz*vy
-        fy = uz*vx - ux*vz
-        fz = ux*vy - uy*vx
-        nx[i0]+=fx; ny[i0]+=fy; nz[i0]+=fz
-        nx[i1]+=fx; ny[i1]+=fy; nz[i1]+=fz
-        nx[i2]+=fx; ny[i2]+=fy; nz[i2]+=fz
-    out=[]
-    for i in range(n):
-        L=math.sqrt(nx[i]*nx[i]+ny[i]*ny[i]+nz[i]*nz[i]) or 1.0
-        out.append((nx[i]/L, ny[i]/L, nz[i]/L))
+def compute_normals(verts: List[Tuple[float, float, float]],
+                    faces: List[Tuple[int, int, int]]) -> List[Tuple[float, float, float]]:
+    nx = [0.0] * len(verts)
+    ny = [0.0] * len(verts)
+    nz = [0.0] * len(verts)
+    for i0, i1, i2 in faces:
+        x0, y0, z0 = verts[i0]
+        x1, y1, z1 = verts[i1]
+        x2, y2, z2 = verts[i2]
+        ux, uy, uz = x1 - x0, y1 - y0, z1 - z0
+        vx, vy, vz = x2 - x0, y2 - y0, z2 - z0
+        cx, cy, cz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx  # area-weighted
+        nx[i0] += cx; ny[i0] += cy; nz[i0] += cz
+        nx[i1] += cx; ny[i1] += cy; nz[i1] += cz
+        nx[i2] += cx; ny[i2] += cy; nz[i2] += cz
+    out = []
+    for i in range(len(verts)):
+        L = math.sqrt(nx[i] * nx[i] + ny[i] * ny[i] + nz[i] * nz[i]) or 1.0
+        out.append((nx[i] / L, ny[i] / L, nz[i] / L))
     return out
 
-# ----------------- glTF / GLB ---------------------
-def _pad4(b): return b + (b' ' * ((4 - (len(b)%4))%4))
+def face_normal(vertices: List[Tuple[float, float, float]], i0: int, i1: int, i2: int) -> Tuple[float, float, float]:
+    x0, y0, z0 = vertices[i0]
+    x1, y1, z1 = vertices[i1]
+    x2, y2, z2 = vertices[i2]
+    ux, uy, uz = x1 - x0, y1 - y0, z1 - z0
+    vx, vy, vz = x2 - x0, y2 - y0, z2 - z0
+    return (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
 
-def make_glb(local_positions, indices, normals=None, mode=4):
+def flip_winding_if_needed(verts: List[Tuple[float, float, float]],
+                           faces: List[Tuple[int, int, int]],
+                           up_axis: str = 'Y') -> List[Tuple[int, int, int]]:
     """
-    mode: 4 = TRIANGLES, 1 = LINES
+    Ensure each triangle's front face points toward +Up.
+    For glTF Y-up we want normal.y >= 0. Flip any that face down.
     """
-    if normals is None:
-        normals = compute_normals(local_positions, indices)
+    up_index = {'X': 0, 'Y': 1, 'Z': 2}[up_axis]
+    fixed = []
+    for (i0, i1, i2) in faces:
+        n = face_normal(verts, i0, i1, i2)
+        if n[up_index] < 0:
+            fixed.append((i0, i2, i1))  # flip
+        else:
+            fixed.append((i0, i1, i2))
+    return fixed
 
-    pos_bytes = b''.join(struct.pack('<fff', *p) for p in local_positions)
-    nor_bytes = b''.join(struct.pack('<fff', *n) for n in normals)
+def write_glb(path: str,
+              vertices: List[Tuple[float, float, float]],
+              normals: List[Tuple[float, float, float]],
+              indices: List[Tuple[int, int, int]]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    if INDEX_UINT_SIZE==2:
-        maxi = max(indices) if indices else 0
-        if maxi>65535: raise ValueError("Use INDEX_UINT_SIZE=4 for large meshes")
-        idx_bytes = b''.join(struct.pack('<H', i) for i in indices)
-        ctype = 5123  # UNSIGNED_SHORT
+    # Interleave buffers (packed, no stride)
+    pos = b"".join(struct.pack("<fff", *v) for v in vertices)
+    nor = b"".join(struct.pack("<fff", *n) for n in normals)
+    flat = [i for tri in indices for i in tri]
+    use_u16 = (max(flat) if flat else 0) < 65536
+    if use_u16:
+        ib = b"".join(struct.pack("<H", i) for i in flat); itype = 5123  # UNSIGNED_SHORT
     else:
-        idx_bytes = b''.join(struct.pack('<I', i) for i in indices)
-        ctype = 5125  # UNSIGNED_INT
+        ib = b"".join(struct.pack("<I", i) for i in flat); itype = 5125  # UNSIGNED_INT
 
-    bin_data = pos_bytes + nor_bytes + idx_bytes
+    def align4(n: int) -> int:
+        return (n + 3) & ~3
 
-    bufferViews=[]; accessors=[]
-    def add_bv(off, length, target):
-        bufferViews.append({"buffer":0,"byteOffset":off,"byteLength":length,"target":target})
-        return len(bufferViews)-1
+    # Buffer layout with 4-byte alignment
+    pos_off = 0
+    pos_len = len(pos)
+    nor_off = align4(pos_off + pos_len)
+    nor_pad = b"\0" * (nor_off - (pos_off + pos_len))
+    idx_off = align4(nor_off + len(nor))
+    idx_pad = b"\0" * (idx_off - (nor_off + len(nor)))
+    bin_blob = pos + nor_pad + nor + idx_pad + ib
+    bin_blob += b"\0" * ((4 - len(bin_blob) % 4) % 4)
 
-    # positions
-    off_pos = 0
-    bv_pos = add_bv(off_pos, len(pos_bytes), 34962)   # ARRAY_BUFFER
-    accessors.append({
-        "bufferView": bv_pos, "byteOffset": 0, "componentType": 5126, "count": len(local_positions), "type":"VEC3",
-        "min":[min(p[i] for p in local_positions) for i in range(3)],
-        "max":[max(p[i] for p in local_positions) for i in range(3)],
-    })
-
-    # normals
-    off_nor = off_pos + len(pos_bytes)
-    bv_nor = add_bv(off_nor, len(nor_bytes), 34962)
-    accessors.append({
-        "bufferView": bv_nor, "byteOffset": 0, "componentType": 5126, "count": len(normals), "type":"VEC3"
-    })
-
-    # indices
-    off_idx = off_nor + len(nor_bytes)
-    bv_idx = add_bv(off_idx, len(idx_bytes), 34963)   # ELEMENT_ARRAY_BUFFER
-    accessors.append({
-        "bufferView": bv_idx, "byteOffset": 0, "componentType": ctype, "count": len(indices), "type":"SCALAR"
-    })
+    # Accessors (POSITION min/max)
+    xs = [v[0] for v in vertices]; ys = [v[1] for v in vertices]; zs = [v[2] for v in vertices]
+    pos_min = [min(xs), min(ys), min(zs)] if vertices else [0, 0, 0]
+    pos_max = [max(xs), max(ys), max(zs)] if vertices else [0, 0, 0]
 
     gltf = {
-        "asset":{"version":"2.0"},
-        "buffers":[{"byteLength": len(bin_data)}],
-        "bufferViews": bufferViews,
-        "accessors": accessors,
-        "materials":[{
-            "doubleSided": True,
-            "pbrMetallicRoughness": {
-                "baseColorFactor": [0.87,0.87,0.87,1.0],
-                "metallicFactor": 0.0,
-                "roughnessFactor": 1.0
-            }
+        "asset": {"version": "2.0", "generator": "tin_to_quadtree_tileset.py"},
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{
+            "primitives": [{
+                "attributes": {"POSITION": 0, "NORMAL": 1},
+                "indices": 2,
+                "material": 0
+            }]
         }],
-        "meshes":[{"primitives":[{
-            "attributes":{"POSITION":0,"NORMAL":1},
-            "indices":2, "mode": mode, "material":0
-        }]}],
-        "nodes":[{"mesh":0}],
-        "scenes":[{"nodes":[0]}],
-        "scene":0
-    }
-
-    gltf_json = json.dumps(gltf, separators=(',',':')).encode('utf-8')
-    gltf_json_padded = _pad4(gltf_json)
-    bin_padded = _pad4(bin_data)
-    total_len = 12 + 8 + len(gltf_json_padded) + 8 + len(bin_padded)
-
-    glb = []
-    glb.append(struct.pack('<I',0x46546C67))  # 'glTF'
-    glb.append(struct.pack('<I',2))
-    glb.append(struct.pack('<I',total_len))
-    glb.append(struct.pack('<I',len(gltf_json_padded)))
-    glb.append(struct.pack('<I',0x4E4F534A))  # 'JSON'
-    glb.append(gltf_json_padded)
-    glb.append(struct.pack('<I',len(bin_padded)))
-    glb.append(struct.pack('<I',0x004E4942))  # 'BIN\0'
-    glb.append(bin_padded)
-    return b''.join(glb)
-
-def wrap_b3dm(glb_bytes, feature_table_json=None, batch_table_json=None):
-    if feature_table_json is None:
-        feature_table_json = {"BATCH_LENGTH": 0}
-    ft = json.dumps(feature_table_json, separators=(',',':')).encode('utf-8')
-    bt = json.dumps(batch_table_json or {}, separators=(',',':')).encode('utf-8')
-    ftb=_pad4(ft); btb=_pad4(bt)
-    header_len=28
-    byteLength = header_len + len(ftb) + len(btb) + len(glb_bytes)
-    header = struct.pack('<4sIIIIII', b'b3dm', 1, byteLength, len(ftb), 0, len(btb), 0)
-    return header + ftb + btb + glb_bytes
-
-# ----------------- Quadtree -----------------------
-class Node:
-    __slots__=("w","s","e","n","d","id","tris","kids","tri_count_subtree")
-    def __init__(self, w,s,e,n, d, id_):
-        self.w=w; self.s=s; self.e=e; self.n=n
-        self.d=d; self.id=id_
-        self.tris=[]; self.kids=None
-        self.tri_count_subtree=0
-
-def subdivide(root, max_tris, max_depth):
-    q = deque([root])
-    while q:
-        node = q.popleft()
-        if node.d >= max_depth or len(node.tris) <= max_tris:
-            continue
-        w,s,e,n = node.w,node.s,node.e,node.n
-        cx=(w+e)/2.0; cy=(s+n)/2.0
-        kids = [
-            Node(w, cy, cx, n, node.d+1, node.id+"0"), # NW
-            Node(cx,cy, e, n, node.d+1, node.id+"1"),  # NE
-            Node(w, s, cx, cy, node.d+1, node.id+"2"), # SW
-            Node(cx,s, e, cy, node.d+1, node.id+"3"),  # SE
+        "materials": [{
+            "doubleSided": True,  # Set False if you trust winding and want culling
+            "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 1.0}
+        }],
+        "buffers": [{"byteLength": len(bin_blob)}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": pos_off, "byteLength": pos_len,          "target": 34962},
+            {"buffer": 0, "byteOffset": nor_off, "byteLength": len(nor),         "target": 34962},
+            {"buffer": 0, "byteOffset": idx_off, "byteLength": len(ib),          "target": 34963},
+        ],
+        "accessors": [
+            {"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": len(vertices), "type": "VEC3",
+             "min": pos_min, "max": pos_max},
+            {"bufferView": 1, "byteOffset": 0, "componentType": 5126, "count": len(normals),  "type": "VEC3"},
+            {"bufferView": 2, "byteOffset": 0, "componentType": itype, "count": len(flat),    "type": "SCALAR"},
         ]
-        bins=[[],[],[],[]]
-        for tri in node.tris:
-            clon,clat,_ = tri_centroid_lonlat(tri)
-            idx = (0 if clat>=cy and clon<cx else
-                   1 if clat>=cy and clon>=cx else
-                   2 if clat<cy  and clon<cx else 3)
-            bins[idx].append(tri)
-        for i,k in enumerate(kids): k.tris = bins[i]
-        node.kids = kids
-        node.tris = []
-        q.extend(kids)
-
-    # populate subtree triangle counts
-    def count_tris(n: Node):
-        if n.kids is None:
-            n.tri_count_subtree = len(n.tris)
-        else:
-            total = 0
-            for k in n.kids:
-                total += count_tris(k)
-            n.tri_count_subtree = total
-        return n.tri_count_subtree
-    count_tris(root)
-
-def sample_from_subtree(node: Node, limit: int):
-    """Collect up to 'limit' triangles from leaves in this subtree."""
-    out=[]; stack=[node]
-    while stack and len(out)<limit:
-        cur = stack.pop()
-        if cur.kids is None:
-            if cur.tris:
-                step=max(1, len(cur.tris) // max(1, limit // 4))
-                out.extend(cur.tris[::step])
-        else:
-            # push larger subtrees first
-            ks = sorted(cur.kids, key=lambda k: k.tri_count_subtree, reverse=True)
-            stack.extend(ks)
-    return out[:limit]
-
-# -------------- Mesh builders / writers -----------
-def build_local_mesh(tris, lon0, lat0, origin_ecef):
-    R = ecef_to_enu_rows(lon0, lat0)
-    verts=[]; vmap={}; idx=[]; edges=set()
-    def to_enu(lon,lat,h):
-        pe=geodetic_to_ecef(lon,lat,h)
-        dx=pe[0]-origin_ecef[0]; dy=pe[1]-origin_ecef[1]; dz=pe[2]-origin_ecef[2]
-        ex = R[0][0]*dx + R[0][1]*dy + R[0][2]*dz
-        ny = R[1][0]*dx + R[1][1]*dy + R[1][2]*dz
-        uz = R[2][0]*dx + R[2][1]*dy + R[2][2]*dz
-        return (ex,ny,uz)
-    def add_v(v):
-        if v in vmap: return vmap[v]
-        p = to_enu(*v); i=len(verts); verts.append(p); vmap[v]=i; return i
-    for a,b,c in tris:
-        i0=add_v(a); i1=add_v(b); i2=add_v(c)
-        # CCW in ENU (z-up): ensure +Z normal
-        x0,y0,z0=verts[i0]; x1,y1,z1=verts[i1]; x2,y2,z2=verts[i2]
-        ux,uy,uz=(x1-x0,y1-y0,z1-z0); vx,vy,vz=(x2-x0,y2-y0,z2-z0)
-        fz = ux*vy - uy*vx
-        if fz < 0.0:
-            i1,i2 = i2,i1
-        idx.extend([i0,i1,i2])
-        e0=tuple(sorted((i0,i1))); e1=tuple(sorted((i1,i2))); e2=tuple(sorted((i2,i0)))
-        edges.add(e0); edges.add(e1); edges.add(e2)
-    # line indices for wireframe
-    lines=[]
-    for a,b in edges:
-        lines.extend([a,b])
-    return verts, idx, lines
-
-def write_tile_files(tile_dir, node: Node, tris, add_wire):
-    if not tris: return None
-    w,s,e,n = node.w,node.s,node.e,node.n
-    lon0=(w+e)/2.0; lat0=(s+n)/2.0
-    hs=[h for t in tris for (_,_,h) in t]
-    h0 = sorted(hs)[len(hs)//2] if hs else 0.0
-
-    origin_ecef = geodetic_to_ecef(lon0, lat0, h0)
-    verts, tri_idx, line_idx = build_local_mesh(tris, lon0, lat0, origin_ecef)
-
-    glb_tri = make_glb(verts, tri_idx, normals=None, mode=4)
-    if WRITE_B3DM:
-        payload = wrap_b3dm(glb_tri); ext=".b3dm"
-    else:
-        payload = glb_tri; ext=".glb"
-    fname = f"tile_{node.id or 'root'}{ext}"
-    with open(os.path.join(tile_dir, fname), "wb") as f: f.write(payload)
-
-    wire_uri = None
-    if add_wire and line_idx:
-        glb_lin = make_glb(verts, line_idx, normals=[(0,0,1)]*len(verts), mode=1)
-        wire_payload = wrap_b3dm(glb_lin) if WRITE_B3DM else glb_lin
-        wire_uri = f"tile_{node.id or 'root'}_wire{ext}"
-        with open(os.path.join(tile_dir, wire_uri), "wb") as f: f.write(wire_payload)
-
-    west_r,south_r,east_r,north_r = map(deg2rad, (w,s,e,n))
-    hmin_p = (min(hs) if hs else h0) - REGION_PAD_BOTTOM_M
-    hmax_p = (max(hs) if hs else h0) + REGION_PAD_TOP_M
-    extent_m = max(ground_extent_meters(w,s,e,n), 1.0)
-    ge = max(extent_m * GE_SCALE, GE_MIN)
-
-    return {
-        "uri": fname,
-        "wire_uri": wire_uri,
-        "transform": enu_to_ecef_transform(lon0,lat0,origin_ecef),
-        "region": [west_r,south_r,east_r,north_r,hmin_p,hmax_p],
-        "ge": ge
     }
 
-def build_tileset(root: Node, out_dir):
-    tiles_dir = os.path.join(out_dir, "tiles")
-    os.makedirs(tiles_dir, exist_ok=True)
+    jb = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    jb += b" " * ((4 - len(jb) % 4) % 4)
+    glb_len = 12 + 8 + len(jb) + 8 + len(bin_blob)
 
-    def build_json(node: Node):
-        # choose content tris for this node
-        if node.kids is None:
-            tris_here = node.tris
-        else:
-            # internal node: always sample from subtree (guaranteed non-empty if subtree has tris)
-            want = max(100, min(5000, node.tri_count_subtree // 10 or 100))
-            tris_here = sample_from_subtree(node, want)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", 0x46546C67))  # 'glTF'
+        f.write(struct.pack("<I", 2))           # version 2
+        f.write(struct.pack("<I", glb_len))
+        f.write(struct.pack("<I", len(jb)));        f.write(b"JSON"); f.write(jb)
+        f.write(struct.pack("<I", len(bin_blob)));  f.write(b"BIN\0"); f.write(bin_blob)
 
-        info = write_tile_files(tiles_dir, node, tris_here, add_wire=WRITE_WIREFRAME)
-        # fallback empty (rare)
-        if info is None:
-            region=[*map(deg2rad,(node.w,node.s,node.e,node.n)), 0.0, 10.0]
-            ge_here = max(ground_extent_meters(node.w,node.s,node.e,node.n) * GE_SCALE, GE_MIN)
-            out = {"boundingVolume":{"region":region}, "geometricError": ge_here, "refine":"REPLACE"}
-        else:
-            out = {
-                "boundingVolume":{"region": info["region"]},
-                "geometricError": max(info["ge"], GE_MIN),
-                "refine":"REPLACE",
-                "transform": info["transform"],
-                "content":{"uri":"tiles/"+info["uri"]}
+@dataclass
+class TileNode:
+    level: int
+    ix: int
+    iy: int
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    tri_ids: List[int]
+    children: List["TileNode"]
+
+
+def rotate_yup_to_zup(p):
+    """
+    Rotate +90° around X to convert Y-up -> Z-up.
+    (x, y, z) -> (x, -z, y)
+    """
+    x, y, z = p
+    return (x, -z, y)
+
+def tri_centroid_xy(tri):
+    # Horizontal plane is X-Y in Z-up tile space (E-N)
+    cx = (tri[0][0] + tri[1][0] + tri[2][0]) / 3.0
+    cy = (tri[0][1] + tri[1][1] + tri[2][1]) / 3.0
+    return (cx, cy)
+
+
+
+def build_quadtree(tris_local: List[List[Tuple[float, float, float]]],
+                   root_bounds: Tuple[float, float, float, float],
+                   max_tris: int,
+                   max_depth: int) -> TileNode:
+    xmin, ymin, xmax, ymax = root_bounds
+    root = TileNode(0, 0, 0, xmin, ymin, xmax, ymax, list(range(len(tris_local))), [])
+
+    def split(node: TileNode) -> None:
+        if node.level >= max_depth or len(node.tri_ids) <= max_tris:
+            return
+        cx = (node.xmin + node.xmax) * 0.5
+        cy = (node.ymin + node.ymax) * 0.5
+
+        buckets: Dict[int, List[int]] = {0: [], 1: [], 2: [], 3: []}  # NW, NE, SW, SE in (X,Z)
+        for tid in node.tri_ids:
+            x, z = tri_centroid_xy(tris_local[tid])
+            if   x < cx and z >= cy: q = 0  # NW
+            elif x >= cx and z >= cy: q = 1 # NE
+            elif x < cx and z <  cy: q = 2  # SW
+            else:                     q = 3  # SE
+            buckets[q].append(tid)
+
+        node.children = []
+        # Child bounds in (X,Z)
+        child_defs = [
+            (0, node.xmin, cy,       cx,       node.ymax),  # NW
+            (1, cx,        cy,       node.xmax, node.ymax), # NE
+            (2, node.xmin, node.ymin, cx,       cy),        # SW
+            (3, cx,        node.ymin, node.xmax, cy),       # SE
+        ]
+        for q, _, xmin_c, ymin_c, xmax_c, ymax_c in [(q, q, *b) for q, *b in [(0, node.xmin, cy,        cx,        node.ymax),
+                                                                               (1, cx,       cy,        node.xmax, node.ymax),
+                                                                               (2, node.xmin, node.ymin, cx,       cy),
+                                                                               (3, cx,       node.ymin, node.xmax, cy)]]:
+            dx = 0 if q in (0, 2) else 1
+            dy = 1 if q in (0, 1) else 0
+            child = TileNode(node.level + 1, node.ix * 2 + dx, node.iy * 2 + dy,
+                             xmin_c, ymin_c, xmax_c, ymax_c, buckets[q], [])
+            if child.tri_ids:
+                node.children.append(child)
+
+        for c in node.children:
+            split(c)
+
+        if node.children:
+            node.tri_ids = []
+
+    split(root)
+    return root
+
+def submesh_for_tile(tris_local, tri_ids):
+    vmap: Dict[Tuple[float, float, float], int] = {}
+    verts: List[Tuple[float, float, float]] = []
+    faces: List[Tuple[int, int, int]] = []
+    for tid in tri_ids:
+        tri = tris_local[tid]
+        idx: List[int] = []
+        for p in tri:
+            i = vmap.get(p)
+            if i is None:
+                i = len(verts); verts.append(p); vmap[p] = i
+            idx.append(i)
+        if len(set(idx)) == 3:
+            faces.append((idx[0], idx[1], idx[2]))
+    return verts, faces
+
+def aabb_of_vertices(verts):
+    if not verts:
+        return (0, 0, 0, 1, 1, 1)
+    xs = [v[0] for v in verts]; ys = [v[1] for v in verts]; zs = [v[2] for v in verts]
+    return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+def box_from_aabb(aabb):
+    xmin, ymin, zmin, xmax, ymax, zmax = aabb
+    cx = (xmin + xmax) / 2; cy = (ymin + ymax) / 2; cz = (zmin + zmax) / 2
+    hx = (xmax - xmin) / 2; hy = (ymax - ymin) / 2; hz = (zmax - zmin) / 2
+    # 12-number OBB in local coords (axis-aligned here)
+    return [cx, cy, cz,  hx, 0, 0,  0, hy, 0,  0, 0, hz]
+
+def write_tileset_json(path, root_dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(root_dict, f, indent=2)
+
+
+def get_result(result, features, design_file_name, redis_key, design_id):
+    if result and len(result) > 0:
+        output_json = {"type": "MultiPolygon", "coordinates": []}
+
+        for data in result:
+            tris_raw = parse_tin_to_triangles(json.loads(data[0])['coordinates'])
+            if not tris_raw:
+                raise ValueError("No triangles parsed from TIN")
+
+            xs = [p[0] for t in tris_raw for p in t]
+            ys = [p[1] for t in tris_raw for p in t]
+            zs = [p[2] for t in tris_raw for p in t]
+            x0 = sum(xs) / len(xs)
+            y0 = sum(ys) / len(ys)
+            h0 = sum(zs) / len(zs)
+            lon0, lat0 = proj_xy_to_lonlat(x0, y0)
+
+            tris_enu = [[(p[0] - x0, p[1] - y0, p[2] - h0) for p in tri] for tri in tris_raw]
+
+            # 1) MODEL vertices for GLB (Y-up): X=E, Y=U, Z=-N
+            def enu_to_model(p):
+                E, N, U = p
+                return (E, U, -N)
+
+            tris_model = [[enu_to_model(p) for p in tri] for tri in tris_enu]
+
+            # 2) TILE vertices for BV/quadtree (Z-up) = rotate model by +90° about X
+            tris_tile = [[rotate_yup_to_zup(p) for p in tri] for tri in tris_model]
+
+            # Root bounds for quadtree in TILE space (X-Y horizontal)
+            xmin = min(v[0] for tri in tris_tile for v in tri)
+            xmax = max(v[0] for tri in tris_tile for v in tri)
+            ymin = min(v[1] for tri in tris_tile for v in tri)
+            ymax = max(v[1] for tri in tris_tile for v in tri)
+            root_bounds = (xmin, ymin, xmax, ymax)
+
+            # Build quadtree using TILE (Z-up) tris and XY centroid
+            root = build_quadtree(tris_tile, root_bounds, MAX_TRIS_PER_TILE, MAX_DEPTH)
+
+            # IMPORTANT: Use Z-up transform at the root: columns [E, N, U]
+            transform = enu_to_ecef_transform(lon0, lat0, h0)
+
+            # Geometric error from horizontal XY span
+            root_diag = math.hypot(xmax - xmin, ymax - ymin)
+            root_ge = max(root_diag, 1.0)
+
+            def emit_tile(node: TileNode, parent_ge: float) -> Optional[dict]:
+                ge = parent_ge / 2.0 if node.level > 0 else parent_ge
+                children_json = []
+                content_uri = None
+
+                if not node.children and node.tri_ids:
+                    # Build submeshes separately:
+                    # - verts_model for GLB (Y-up)
+                    # - verts_tile  for BV (Z-up)
+                    verts_model, faces = submesh_for_tile(tris_model, node.tri_ids)
+                    if not faces:
+                        return None
+
+                    # For GLB authored Y-up, flip winding against Y
+                    faces = flip_winding_if_needed(verts_model, faces, up_axis='Y')
+                    norms = compute_normals(verts_model, faces)
+
+                    subdir = os.path.join(OUT_DIR, TILES_DIR, str(node.level), str(node.ix), str(node.iy))
+                    glb_path = os.path.join(subdir, "tile.glb")
+                    write_glb(glb_path, verts_model, norms, faces)
+                    content_uri = os.path.relpath(glb_path, OUT_DIR).replace("\\", "/")
+
+                    # Bounding box must be in TILE (Z-up) space
+                    verts_tile, _ = submesh_for_tile(tris_tile, node.tri_ids)
+                    aabb = aabb_of_vertices(verts_tile)
+                    box = box_from_aabb(aabb)
+
+                else:
+                    for c in node.children:
+                        cj = emit_tile(c, ge)
+                        if cj is not None:
+                            children_json.append(cj)
+                    if not children_json:
+                        return None
+
+                    # Union child boxes (already in TILE/Z-up space)
+                    mins = [];
+                    maxs = []
+                    for ch in children_json:
+                        bx = ch["boundingVolume"]["box"]
+                        cx, cy, cz, hxx, hxy, hxz, hyx, hyy, hyz, hzx, hzy, hzz = bx
+                        xmin_c = cx - abs(hxx) - abs(hyx) - abs(hzx)
+                        xmax_c = cx + abs(hxx) + abs(hyx) + abs(hzx)
+                        ymin_c = cy - abs(hxy) - abs(hyy) - abs(hzy)
+                        ymax_c = cy + abs(hxy) + abs(hyy) + abs(hzy)
+                        zmin_c = cz - abs(hxz) - abs(hyz) - abs(hzz)
+                        zmax_c = cz + abs(hxz) + abs(hyz) + abs(hzz)
+                        mins.append((xmin_c, ymin_c, zmin_c))
+                        maxs.append((xmax_c, ymax_c, zmax_c))
+                    xmin_u = min(m[0] for m in mins);
+                    ymin_u = min(m[1] for m in mins);
+                    zmin_u = min(m[2] for m in mins)
+                    xmax_u = max(m[0] for m in maxs);
+                    ymax_u = max(m[1] for m in maxs);
+                    zmax_u = max(m[2] for m in maxs)
+                    box = box_from_aabb((xmin_u, ymin_u, zmin_u, xmax_u, ymax_u, zmax_u))
+
+                tile = {
+                    "boundingVolume": {"box": box},
+                    "geometricError": 0.0 if not children_json else ge,
+                    "refine": "REPLACE"
+                }
+                if content_uri:
+                    tile["content"] = {"uri": content_uri}
+                if children_json:
+                    tile["children"] = children_json
+                return tile
+
+            root_tile = emit_tile(root, root_ge)
+
+            tileset = {
+                "asset": {"version": "1.1"},
+                "geometricError": root_ge,
+                "root": {
+                    "transform": transform,  # columns [E, N, U]
+                    "boundingVolume": root_tile["boundingVolume"],
+                    "geometricError": root_tile.get("geometricError", 0.0),
+                    "refine": "REPLACE",
+                    **({"content": root_tile["content"]} if "content" in root_tile else {}),
+                    **({"children": root_tile["children"]} if "children" in root_tile else {})
+                }
             }
-            if info["wire_uri"]:
-                out.setdefault("children", []).append({
-                    "boundingVolume":{"region": info["region"]},
-                    "geometricError": GE_MIN,
-                    "refine":"REPLACE",
-                    "transform": info["transform"],
-                    "content":{"uri":"tiles/"+info["wire_uri"]}
-                })
 
-        # children
-        if node.kids:
-            kids_json = [build_json(k) for k in node.kids]
-            out.setdefault("children", []).extend(kids_json)
+            os.makedirs(OUT_DIR, exist_ok=True)
+            tileset_path = os.path.join(OUT_DIR, ROOT_TILE_FILENAME)
+            write_tileset_json(tileset_path, tileset)
 
-            # keep parent GE ≥ max(child GE)
-            max_child_ge = max(k.get("geometricError", GE_MIN) for k in kids_json)
-            out["geometricError"] = max(out["geometricError"], max_child_ge)
-
-        return out
-
-    root_json = build_json(root)
-    root_extent_m = max(ground_extent_meters(root.w,root.s,root.e,root.n), 1.0)
-    tileset = {
-        "asset":{"version":"1.0"},
-        "geometricError": max(root_extent_m * GE_SCALE, GE_MIN),
-        "root": root_json
-    }
-    with open(os.path.join(out_dir, "tileset.json"), "w", encoding="utf-8") as f:
-        json.dump(tileset, f, separators=(',',':'))
-    return tileset
-
-# ----------------- Public API / Main ---------------
-def tin_to_3dtiles(tin_nested, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    tris = flatten_tin(tin_nested)
-    if not tris:
-        raise ValueError("No triangles parsed from input.")
-
-    w,s,e,n,hmin,hmax = lonlat_bounds(tris)
-    root = Node(w,s,e,n, 0, "")
-    root.tris = tris
-    subdivide(root, MAX_TRIANGLES_PER_TILE, MAX_DEPTH)
-
-    # dump standalone GLBs (sanity) from full mesh at area center
-    if WRITE_STANDALONE_GLBS:
-        lon0=(w+e)/2.0; lat0=(s+n)/2.0
-        hs=[h for t in tris for (_,_,h) in t]; h0 = sorted(hs)[len(hs)//2] if hs else 0.0
-        origin_ecef=geodetic_to_ecef(lon0,lat0,h0)
-        verts, tri_idx, line_idx = build_local_mesh(tris, lon0, lat0, origin_ecef)
-        glb_tri = make_glb(verts, tri_idx, normals=None, mode=4)
-        with open(os.path.join(output_dir,"_ALL_TRIANGLES.glb"),"wb") as f: f.write(glb_tri)
-        glb_lin = make_glb(verts, line_idx, normals=[(0,0,1)]*len(verts), mode=1)
-        with open(os.path.join(output_dir,"_ALL_WIREFRAME.glb"),"wb") as f: f.write(glb_lin)
-
-    return build_tileset(root, output_dir)
-
-# --------------- Example run -----------------------
-if __name__ == "__main__":
-    # Replace this with your real nested TIN data
-    TIN_DATA = [
-        [[[77.2090, 28.6139, 230.0], [77.2095, 28.6142, 232.0], [77.2086, 28.6140, 231.0]]],
-        [[[77.2096, 28.6145, 233.0], [77.2090, 28.6139, 230.0], [77.2100, 28.6142, 229.0]]]
-    ]
-    OUTPUT_DIR = "./tin_tiles_out"
-    tileset = tin_to_3dtiles(TIN_DATA, OUTPUT_DIR)
-    print("Wrote:", os.path.abspath(os.path.join(OUTPUT_DIR, "tileset.json")))
-    print("Tiles:", os.path.abspath(os.path.join(OUTPUT_DIR, "tiles")))
-    if WRITE_STANDALONE_GLBS:
-        print("Debug GLBs:", os.path.abspath(os.path.join(OUTPUT_DIR,"_ALL_TRIANGLES.glb")),
-              os.path.abspath(os.path.join(OUTPUT_DIR,"_ALL_WIREFRAME.glb")))
+            print(f"Tileset written to: {os.path.join(OUT_DIR, ROOT_TILE_FILENAME)}")
