@@ -1,0 +1,1 @@
+  subStates: ['Engine Stop', 'Long Idling', 'Medium Idling', 'Productive Idling', 'Short Idling', 'Working']
