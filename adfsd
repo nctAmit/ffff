@@ -1,0 +1,861 @@
+// ClusteredMarkersLayer.ts
+import {
+  Cartesian2,
+  Cartesian3,
+  Cartographic,
+  Math as CesiumMath,
+  Color,
+  CustomDataSource,
+  Entity,
+  JulianDate,
+  PropertyBag,
+  Rectangle,
+  SceneTransforms,
+  ScreenSpaceEventHandler,
+  ScreenSpaceEventType,
+  VerticalOrigin,
+  Viewer,
+} from 'cesium';
+
+// ------- Your data contracts --------
+export interface MarkerData {
+  point: { lat: number; lng: number };
+  options: {
+    icon: IconDetails;
+    highlightIcon: IconDetails;
+    color: string;
+    zIndexOffset: number;
+  };
+  popupData: { [index: string]: string | number | null };
+}
+
+export interface IconDetails {
+  url: string;
+  size: { x: number; y: number };
+  iconAnchor: { x: number; y: number };
+}
+
+// --------- Internal types ----------
+type ClusterKey = string;
+type ClusterCat = 'L' | 'D' | 'PL' | 'SI';
+
+export interface PillStyle {
+  fontFamily: string;
+  fontPx: number;
+  paddingX: number;
+  paddingY: number;
+  backgroundColor: string;
+  textColor: string;
+  separatorColor: string;
+  dotDiameterPx: number;
+  dotGapPx: number;
+
+  // Colors per category
+  loadDotColor: string;        // L
+  dumpDotColor: string;        // D
+  productiveIdleDotColor: string; // PL
+  sortIdleDotColor: string;       // SI
+}
+
+export interface ClusteredMarkersOptions {
+  enabled?: boolean;
+  pixelRange?: number;
+  minimumClusterSize?: number;
+  labelPrefix?: string;
+  pointPixelSize?: number;
+  getPointColor?: (popupData: Record<string, any>) => Color;
+
+  pillStyle?: PillStyle;
+  autoZoom?: boolean;
+
+  // Callbacks
+  onMarkerClick?: (args: { entity: Entity; event?: Record<string, any>; lat: number; lon: number }) => void;
+  onClusterClick?: (args: { clusterEntity: Entity; members: Entity[]; lat: number; lon: number }) => void;
+
+  dataSourceName?: string;
+
+  // Decluster zoom config
+  ensureDeclusterOnClick?: boolean;
+  minSeparationPx?: number;
+  maxZoomIters?: number;
+  mixedExtraZoomFactor?: number;
+  singleExtraZoomFactor?: number;
+
+  // Popup config
+  popupEnabled?: boolean;
+  buildPopupHtml?: (evt: Record<string, any> | undefined, entity: Entity) => string;
+}
+
+export class ClusteredMarkersLayer {
+  public readonly viewer: Viewer;
+  public readonly dataSource: CustomDataSource;
+  public options: Required<ClusteredMarkersOptions>;
+
+  private clickHandler?: ScreenSpaceEventHandler;
+  private markerIds = new Set<string>();
+  private clusterMembers = new Map<ClusterKey, Entity[]>();
+
+  private clusterStyler: (clusteredEntities: Entity[], cluster: any) => void;
+
+  private popupEl?: HTMLDivElement;
+  private popupAnchor?: Entity;
+  private popupTrackUnsub?: () => void;
+  private carousel?: { entities: Entity[]; index: number; anchor: Entity };
+
+  private dpi = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+  private trackingAttached = false;
+
+  constructor(viewer: Viewer, data: MarkerData[], options?: ClusteredMarkersOptions) {
+    this.viewer = viewer;
+
+    const defaults: Required<ClusteredMarkersOptions> = {
+      enabled: true,
+      pixelRange: 60,
+      minimumClusterSize: 2,
+      labelPrefix: 'L',
+      pointPixelSize: 10,
+      getPointColor: (popup) => {
+        // Use the color from MarkerData.options.color when we created the entity;
+        // fall back to a default if needed.
+        return Color.fromCssColorString((popup?.color as string) || '#1976d2');
+      },
+      pillStyle: {
+        fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+        fontPx: 18,
+        paddingX: 12,
+        paddingY: 6,
+        backgroundColor: 'whitesmoke',
+        textColor: '#000000',
+        separatorColor: '#000000',
+        dotDiameterPx: 10,
+        dotGapPx: 6,
+        loadDotColor: 'rgb(152, 38, 222)',          // purple (L)
+        dumpDotColor: 'rgb(254, 90, 171)',          // pink (D)
+        productiveIdleDotColor: 'rgb(0, 150, 136)', // teal (PL)
+        sortIdleDotColor: 'rgb(255, 152, 0)',       // amber (SI)
+      },
+      autoZoom: true,
+      onMarkerClick: () => {},
+      onClusterClick: () => {},
+      dataSourceName: 'clusteredMarkers',
+      ensureDeclusterOnClick: true,
+      minSeparationPx: 64,
+      maxZoomIters: 6,
+      mixedExtraZoomFactor: 0.85,
+      singleExtraZoomFactor: 0.9,
+      popupEnabled: true,
+      buildPopupHtml: undefined as any,
+    };
+
+    this.options = { ...defaults, ...(options || {}) };
+    if (!options?.minSeparationPx) {
+      this.options.minSeparationPx = (options?.pixelRange ?? this.options.pixelRange) + 4;
+    }
+
+    this.dataSource = new CustomDataSource(this.options.dataSourceName);
+    void this.viewer.dataSources.add(this.dataSource);
+
+    // Cluster styler → dynamically handle L / D / PL / SI
+    this.clusterStyler = (clusteredEntities, cluster) => {
+      const buckets = this.getClusterBuckets(clusteredEntities);
+      const sections = this.buildSectionsForBuckets(buckets, this.options.pillStyle);
+
+      cluster.label.show = false;
+
+      const out = this.drawClusterPill(sections, this.options.pillStyle);
+
+      cluster.billboard.show = true;
+      cluster.billboard.image = out.canvas.toDataURL('image/png');
+      cluster.billboard.verticalOrigin = VerticalOrigin.CENTER;
+      cluster.billboard.width = out.cssWidth;
+      cluster.billboard.height = out.cssHeight;
+
+      // unify picking & store members with a stable key
+      const sharedId = cluster.label.id;
+      const key = this.clusterKeyFrom(sharedId);
+      cluster.billboard.id = sharedId;
+      if (cluster.point) cluster.point.id = sharedId;
+      this.clusterMembers.set(key, clusteredEntities);
+    };
+
+    this.setData(data);
+    this.configureClustering();
+    if (this.options.autoZoom) void this.zoomTo();
+
+    // keyboard
+    window.addEventListener('keydown', (e) => {
+      if (!this.popupEl || this.popupEl.style.display !== 'block') return;
+      if (e.key === 'Escape') this.hidePopup();
+      if (this.carousel) {
+        if (e.key === 'ArrowLeft') this.carouselPrev();
+        if (e.key === 'ArrowRight') this.carouselNext();
+      }
+    });
+
+    // crisp pills on DPR changes
+    window.addEventListener('resize', this.onDpiChange);
+    try {
+      window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`)?.addEventListener?.('change', this.onDpiChange);
+    } catch {}
+  }
+
+  // ---------- Public API ----------
+
+  public setData(markers: MarkerData[]): void {
+    this.clusterMembers.clear();
+    this.markerIds.clear();
+    this.dataSource.entities.removeAll();
+
+    for (const marker of markers) {
+      const { lat, lng } = marker.point;
+      if (!isFinite(lat) || !isFinite(lng)) continue;
+      const position = Cartesian3.fromDegrees(lng, lat, 0);
+
+      const entity = this.dataSource.entities.add({
+        position,
+        point: {
+          pixelSize: this.options.pointPixelSize,
+          color: Color.fromCssColorString(marker.options.color),
+          outlineColor: Color.WHITESMOKE,
+          outlineWidth: 2,
+        },
+      });
+
+      // store JSON for popup & classification
+      const pd: Record<string, any> = {
+        ...marker.popupData,
+        color: marker.options.color,
+        segmentDesc: marker.popupData?.['segmentDesc'] ?? null,
+        subState: marker.popupData?.['subState'] ?? null,
+      };
+
+      entity.properties = new PropertyBag(pd as any);
+      (entity as any).__popup = pd;
+      (entity as any).__cat = this.classify(pd); // 'L' | 'D' | 'PL' | 'SI'
+
+      this.markerIds.add(entity.id);
+    }
+
+    this.forceClusterRefresh();
+    if (this.options.autoZoom) void this.zoomTo();
+  }
+
+  public configureClustering(opts?: Partial<ClusteredMarkersOptions>): void {
+    if (opts) {
+      this.options = { ...this.options, ...opts };
+      if (opts.pixelRange && !opts.minSeparationPx) {
+        this.options.minSeparationPx = this.options.pixelRange + 4;
+      }
+    }
+
+    const clustering = this.dataSource.clustering;
+    clustering.enabled = this.options.enabled;
+    clustering.pixelRange = this.options.pixelRange;
+    clustering.minimumClusterSize = this.options.minimumClusterSize;
+
+    clustering.clusterEvent.removeEventListener(this.clusterStyler);
+    clustering.clusterEvent.addEventListener(this.clusterStyler);
+
+    this.forceClusterRefresh();
+    if (!this.clickHandler) this.installClickHandler();
+  }
+
+  public async zoomTo(): Promise<void> {
+    try { await this.viewer.zoomTo(this.dataSource); } catch {}
+  }
+
+  public async dispose(): Promise<void> {
+    this.dataSource.clustering.clusterEvent.removeEventListener(this.clusterStyler);
+    if (this.clickHandler) { this.clickHandler.destroy(); this.clickHandler = undefined; }
+    try { await this.viewer.dataSources.remove(this.dataSource, true); } catch {}
+    this.clusterMembers.clear();
+    this.markerIds.clear();
+    this.hidePopup();
+
+    window.removeEventListener('resize', this.onDpiChange);
+    try {
+      window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`)?.removeEventListener?.('change', this.onDpiChange);
+    } catch {}
+  }
+
+  public refreshClusterPills(): void {
+    this.forceClusterRefresh();
+  }
+
+  // ---------- Classification ----------
+
+  private classify(popup: Record<string, any>): ClusterCat {
+    const seg = String(popup?.segmentDesc ?? '').trim().toLowerCase();
+    if (seg === 'load') return 'L';
+    if (seg === 'dump') return 'D';
+
+    const sub = String(popup?.subState ?? '').trim().toLowerCase();
+    // exact phrases per your ask
+    if (sub === 'productive idle') return 'PL';
+    if (sub === 'sort idle') return 'SI';
+
+    // Fallback: treat unknowns as SI to avoid hiding points (or choose PL)
+    return 'SI';
+  }
+
+  private getClusterBuckets(entities: Entity[]): Record<ClusterCat, number> {
+    const counts: Record<ClusterCat, number> = { L: 0, D: 0, PL: 0, SI: 0 };
+    const now = JulianDate.now();
+    for (const e of entities) {
+      // For safety: re-evaluate if missing cache
+      const pd: Record<string, any> | undefined = (e as any).__popup ?? (e.properties as any)?.getValue?.(now);
+      const cat: ClusterCat = (e as any).__cat ?? this.classify(pd || {});
+      counts[cat] = (counts[cat] || 0) + 1;
+    }
+    return counts;
+  }
+
+  // ---------- Cluster pill drawing ----------
+
+  private buildSectionsForBuckets(
+    buckets: Record<ClusterCat, number>,
+    style: PillStyle
+  ): Array<{ label: string; count: number; dotColor: string }> {
+    const order: ClusterCat[] = ['L', 'D', 'PL', 'SI'];
+    const colorFor: Record<ClusterCat, string> = {
+      L: style.loadDotColor,
+      D: style.dumpDotColor,
+      PL: style.productiveIdleDotColor,
+      SI: style.sortIdleDotColor,
+    };
+
+    const present = order
+      .map((cat) => ({ cat, count: buckets[cat] || 0 }))
+      .filter((x) => x.count > 0);
+
+    // If exactly one category: single section only
+    if (present.length === 1) {
+      const { cat, count } = present[0];
+      return [{ label: cat, count, dotColor: colorFor[cat] }];
+    }
+
+    // Mixed → build multiple sections in deterministic order
+    return present.map(({ cat, count }) => ({
+      label: cat,
+      count,
+      dotColor: colorFor[cat],
+    }));
+  }
+
+  private drawClusterPill(
+    sections: Array<{ label: string; count: number; dotColor: string }>,
+    style: PillStyle
+  ): { canvas: HTMLCanvasElement; cssWidth: number; cssHeight: number } {
+    const ctxMeasure = document.createElement('canvas').getContext('2d')!;
+    ctxMeasure.font = `${style.fontPx}px ${style.fontFamily}`;
+
+    const dot = style.dotDiameterPx;
+    const gap = style.dotGapPx;
+    const sep = Math.max(1, Math.floor(style.dotGapPx));
+
+    // Measure text for each section
+    const texts = sections.map((s) => `${s.label} ${s.count}`);
+    const widths = texts.map((t) => ctxMeasure.measureText(t).width);
+
+    // Compute inner width: sum of [dot + gap + text] + separators
+    const innerWidth =
+      sections.reduce((acc, _, i) => acc + (dot + gap + widths[i]), 0) + (sections.length > 1 ? (sections.length - 1) * sep : 0);
+
+    const cssWidth = Math.ceil(innerWidth + style.paddingX * 2);
+    const cssHeight = Math.ceil(style.fontPx + style.paddingY * 2);
+
+    const dpr = this.dpi;
+    const canvas = document.createElement('canvas');
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+
+    const ctx = canvas.getContext('2d')!;
+    ctx.scale(dpr, dpr);
+
+    this.roundedRect(ctx, 0.5, 0.5, cssWidth - 1, cssHeight - 1, Math.min(10, cssHeight / 2 - 1), style.backgroundColor);
+
+    ctx.font = `${style.fontPx}px ${style.fontFamily}`;
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = style.textColor;
+
+    let x = style.paddingX;
+    const cy = cssHeight / 2;
+
+    for (let i = 0; i < sections.length; i++) {
+      const sec = sections[i];
+
+      // Dot
+      ctx.fillStyle = sec.dotColor;
+      ctx.beginPath();
+      ctx.arc(x + dot / 2, cy, dot / 2, 0, Math.PI * 2);
+      ctx.fill();
+      x += dot + gap;
+
+      // Text
+      ctx.fillStyle = style.textColor;
+      ctx.fillText(texts[i], x, cy + 0.5);
+      x += widths[i];
+
+      // Separator (between sections)
+      if (i < sections.length - 1) {
+        x += gap / 2;
+        ctx.strokeStyle = style.separatorColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, style.paddingY);
+        ctx.lineTo(x + 0.5, cssHeight - style.paddingY);
+        ctx.stroke();
+        x += sep + gap / 2;
+      }
+    }
+
+    return { canvas, cssWidth, cssHeight };
+  }
+
+  private roundedRect(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    r: number,
+    fillStyle: string
+  ): void {
+    const radius = Math.min(r, w / 2, h / 2);
+    ctx.fillStyle = fillStyle;
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + w, y, x + w, y + h, radius);
+    ctx.arcTo(x + w, y + h, x, y + h, radius);
+    ctx.arcTo(x, y + h, x, y, radius);
+    ctx.arcTo(x, y, x + w, y, radius);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---------- Click handling / popups ----------
+
+  private installClickHandler(): void {
+    this.clickHandler?.destroy();
+    this.clickHandler = new ScreenSpaceEventHandler(this.viewer.scene.canvas);
+
+    // LEFT CLICK
+    this.clickHandler.setInputAction(async (movement) => {
+      const picked = this.viewer.scene.pick(movement.position);
+
+      // If clicked on EMPTY SPACE: close popup and return
+      if (!picked || !picked.id) {
+        this.hidePopup();
+        return;
+      }
+
+      const entity = picked.id as Entity;
+      const now = JulianDate.now();
+      const pos = (entity as any).position?.getValue?.(now);
+      if (!pos) {
+        this.hidePopup();
+        return;
+      }
+
+      const carto = Cartographic.fromCartesian(pos);
+      const lat = CesiumMath.toDegrees(carto.latitude);
+      const lon = CesiumMath.toDegrees(carto.longitude);
+
+      const key = this.clusterKeyFrom(picked.id);
+
+      // --- Cluster clicked ---
+      if (this.clusterMembers.has(key)) {
+        const members = this.clusterMembers.get(key)!;
+
+        if (this.options.onClusterClick) {
+          this.options.onClusterClick({ clusterEntity: entity, members, lat, lon });
+        }
+
+        if (this.options.ensureDeclusterOnClick) {
+          // Choose zoom factor depending on single/mixed categories
+          const buckets = this.getClusterBuckets(members);
+          const nonZero = Object.values(buckets).filter((n) => n > 0).length;
+          const perStep = nonZero > 1 ? this.options.mixedExtraZoomFactor : this.options.singleExtraZoomFactor;
+
+          await this.zoomToSeparate(members, {
+            targetMinPx: this.options.minSeparationPx,
+            maxSteps: this.options.maxZoomIters,
+            perStepFactor: perStep,
+          });
+        } else {
+          await this.zoomToEntitiesOnce(members);
+        }
+
+        this.hidePopup();
+        return;
+      }
+
+      // --- Single marker clicked ---
+      if (entity.id && this.markerIds.has(entity.id)) {
+        const evt: Record<string, any> | undefined = (entity as any).__popup;
+
+        if (this.options.onMarkerClick) {
+          this.options.onMarkerClick({ entity, event: evt, lat, lon });
+        }
+
+        // Drill for same-place markers
+        const picks = this.viewer.scene.drillPick(movement.position) as any[];
+        const now2 = JulianDate.now();
+        const refPos = (entity as any).position?.getValue?.(now2);
+
+        const allMarkerEntities = picks
+          .map((p) => p?.id as Entity)
+          .filter((e): e is Entity => !!e && !!(e as any).__popup && this.markerIds.has(e.id));
+
+        const samePlace: Entity[] = [];
+        for (const e of allMarkerEntities) {
+          const p = (e as any).position?.getValue?.(now2);
+          if (!p) continue;
+          if (Cartesian3.distance(refPos, p) <= 1.0) samePlace.push(e);
+        }
+
+        if (samePlace.length > 1) {
+          // Show carousel anchored at clicked entity
+          this.showCarouselPopup(samePlace, entity);
+        } else if (this.options.popupEnabled) {
+          const html = this.options.buildPopupHtml
+            ? this.options.buildPopupHtml(evt!, entity)
+            : this.buildDefaultPopupHtml(evt!, lat, lon);
+          this.showPopupAt(entity, html);
+        }
+        return;
+      }
+
+      // If some other non-marker primitive: close popup
+      this.hidePopup();
+    }, ScreenSpaceEventType.LEFT_CLICK);
+
+    // RIGHT CLICK → close popup
+    this.clickHandler.setInputAction(() => this.hidePopup(), ScreenSpaceEventType.RIGHT_CLICK);
+  }
+
+  private ensurePopupEl(): void {
+    if (this.popupEl) return;
+    const el = document.createElement('div');
+    el.className = 'cm-popup';
+    Object.assign(el.style, {
+      position: 'absolute',
+      display: 'none',
+      zIndex: '1000',
+      background: '#fff',
+      color: '#111',
+      padding: '10px 12px',
+      borderRadius: '8px',
+      boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
+      pointerEvents: 'auto',
+      maxWidth: '320px',
+      fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+      fontSize: '12px',
+      lineHeight: '1.4',
+      border: '1px solid #e8e8e8',
+    } as CSSStyleDeclaration);
+    this.viewer.container.appendChild(el);
+    this.popupEl = el;
+  }
+
+  private enablePopupTracking(): void {
+    if (this.trackingAttached) return;
+    this.disablePopupTracking();
+    const anchor = this.carousel?.anchor ?? this.popupAnchor;
+    if (!anchor) return;
+    const scene = this.viewer.scene;
+    const tick = () => this.positionPopupAt(anchor);
+    const remove = scene.postRender.addEventListener(tick);
+    this.popupTrackUnsub = () => { remove(); this.trackingAttached = false; };
+    this.trackingAttached = true;
+  }
+
+  private disablePopupTracking(): void {
+    if (this.popupTrackUnsub) this.popupTrackUnsub();
+    this.popupTrackUnsub = undefined;
+    this.trackingAttached = false;
+  }
+
+  private positionPopupAt(entity: Entity): void {
+    if (!this.popupEl) return;
+    const now = JulianDate.now();
+    const pos = (entity as any).position?.getValue?.(now);
+    if (!pos) return;
+    const win = SceneTransforms.worldToWindowCoordinates(this.viewer.scene, pos);
+    if (!win) return;
+
+    const pad = 12;
+    const el = this.popupEl;
+    const container = this.viewer.container;
+
+    let left = win.x + pad;
+    let top = win.y - pad;
+
+    // Clamp within container bounds
+    const maxLeft = container.clientWidth - el.offsetWidth - pad;
+    const maxTop = container.clientHeight - el.offsetHeight - pad;
+
+    left = Math.max(pad, Math.min(left, maxLeft));
+    top = Math.max(pad, Math.min(top, maxTop));
+
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }
+
+  private showPopupAt(entity: Entity, html: string): void {
+    this.ensurePopupEl();
+    if (!this.popupEl) return;
+    this.carousel = undefined;
+    this.popupAnchor = entity;
+    this.popupEl.innerHTML = html;
+    this.popupEl.style.display = 'block';
+    this.positionPopupAt(entity);
+    this.enablePopupTracking();
+  }
+
+  private hidePopup(): void {
+    if (this.popupEl) this.popupEl.style.display = 'none';
+    this.carousel = undefined;
+    this.popupAnchor = undefined;
+    this.disablePopupTracking();
+  }
+
+  private showCarouselPopup(entities: Entity[], anchor: Entity): void {
+    this.ensurePopupEl();
+    if (!this.popupEl) return;
+
+    this.carousel = { entities, index: 0, anchor };
+    this.popupAnchor = undefined; // carousel uses its own anchor
+
+    this.popupEl.innerHTML = `
+      <div style="display:flex; align-items:center; gap:8px;">
+        <button class="cm-prev" title="Previous" style="
+          border:1px solid #ddd; background:#f9f9f9; border-radius:6px; padding:6px 8px; cursor:pointer;">◀</button>
+        <div class="cm-content" style="flex:1; min-width:220px;"></div>
+        <button class="cm-next" title="Next" style="
+          border:1px solid #ddd; background:#f9f9f9; border-radius:6px; padding:6px 8px; cursor:pointer;">▶</button>
+      </div>
+      <div class="cm-indicator" style="margin-top:6px; text-align:center; color:#666; font-weight:600;"></div>
+    `;
+    this.popupEl.style.display = 'block';
+
+    const prevBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-prev')!;
+    const nextBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-next')!;
+    prevBtn.onclick = () => this.carouselPrev();
+    nextBtn.onclick = () => this.carouselNext();
+
+    this.renderCarouselSlide();
+    this.positionPopupAt(anchor);
+    this.enablePopupTracking();
+  }
+
+  private carouselPrev(): void {
+    if (!this.carousel) return;
+    const n = this.carousel.entities.length;
+    this.carousel.index = (this.carousel.index - 1 + n) % n;
+    this.renderCarouselSlide();
+  }
+
+  private carouselNext(): void {
+    if (!this.carousel) return;
+    const n = this.carousel.entities.length;
+    this.carousel.index = (this.carousel.index + 1) % n;
+    this.renderCarouselSlide();
+  }
+
+  private renderCarouselSlide(): void {
+    if (!this.carousel || !this.popupEl) return;
+    const { entities, index, anchor } = this.carousel;
+
+    const e = entities[index];
+    const now = JulianDate.now();
+    const pos = (e as any).position?.getValue?.(now);
+    const carto = pos ? Cartographic.fromCartesian(pos) : undefined;
+    const lat = carto ? CesiumMath.toDegrees(carto.latitude) : NaN;
+    const lon = carto ? CesiumMath.toDegrees(carto.longitude) : NaN;
+
+    const evt: Record<string, any> | undefined = (e as any).__popup;
+    const html = this.options.buildPopupHtml
+      ? this.options.buildPopupHtml(evt!, e)
+      : this.buildDefaultPopupHtml(evt!, lat, lon);
+
+    const content = this.popupEl.querySelector<HTMLDivElement>('.cm-content')!;
+    const indicator = this.popupEl.querySelector<HTMLDivElement>('.cm-indicator')!;
+    content.innerHTML = html;
+    indicator.textContent = `${index + 1} / ${entities.length}`;
+
+    this.positionPopupAt(anchor);
+  }
+
+  private buildDefaultPopupHtml(evt: Record<string, any> | undefined, lat: number, lon: number): string {
+    if (!evt) {
+      return `<div><strong>Marker</strong><br/>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}</div>`;
+    }
+    const rows = Object.entries(evt as any)
+      .map(([k, v]) => {
+        const val = v === null || v === undefined ? '' : String(v);
+        return `<div style="display:flex;gap:8px;margin:2px 0;">
+          <div style="min-width:120px;color:#666;">${this.escape(k)}</div>
+          <div style="flex:1;font-weight:600;">${this.escape(val)}</div>
+        </div>`;
+      })
+      .join('');
+    return `
+      <div>
+        <div style="font-weight:700;margin-bottom:6px;">Details</div>
+        ${rows}
+        <hr style="margin:8px 0;border:none;border-top:1px solid #eee;" />
+        <div style="color:#666;">Lat: ${isFinite(lat) ? lat.toFixed(6) : '-'}, Lon: ${isFinite(lon) ? lon.toFixed(6) : '-'}</div>
+      </div>
+    `;
+  }
+
+  private escape(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // ---------- Zoom helpers ----------
+
+  private rectangleFromEntities(entities: Entity | Entity[]): Rectangle | undefined {
+    const arr = Array.isArray(entities) ? entities : [entities];
+    const now = JulianDate.now();
+    const cartos: Cartographic[] = [];
+    for (const e of arr) {
+      const p = (e as any).position?.getValue?.(now);
+      if (!p) continue;
+      cartos.push(Cartographic.fromCartesian(p));
+    }
+    if (cartos.length === 0) return undefined;
+
+    const rect = Rectangle.fromCartographicArray(cartos);
+    if (rect.west === rect.east && rect.north === rect.south) {
+      return this.expandRectangle(rect, CesiumMath.toRadians(0.0005));
+    }
+    return rect;
+  }
+
+  private expandRectangle(rect: Rectangle, padRad: number): Rectangle {
+    return new Rectangle(rect.west - padRad, rect.south - padRad, rect.east + padRad, rect.north + padRad);
+  }
+
+  private async zoomToEntitiesOnce(entities: Entity[]): Promise<void> {
+    let rect = this.rectangleFromEntities(entities);
+    if (!rect) return;
+    rect = this.expandRectangle(rect, CesiumMath.toRadians(0.01));
+    await this.flyToRectangle(rect, 0.8);
+  }
+
+  private async zoomToSeparate(
+    entities: Entity[],
+    opts?: { targetMinPx?: number; maxSteps?: number; perStepFactor?: number }
+  ): Promise<void> {
+    const targetMinPx = opts?.targetMinPx ?? (this.options.pixelRange + 4);
+    const maxSteps = opts?.maxSteps ?? 6;
+    const perStepFactor = opts?.perStepFactor ?? 0.9;
+
+    let rect = this.rectangleFromEntities(entities);
+    if (!rect) return;
+
+    await this.flyToRectangle(rect, 0.8);
+    await this.waitOnePostRender();
+
+    let prevMinPx = this.minPixelSeparation(entities);
+    for (let step = 0; step < maxSteps; step++) {
+      const minPx = this.minPixelSeparation(entities);
+      if (minPx === Infinity || minPx >= targetMinPx) break;
+
+      rect = this.shrinkRectangle(rect, perStepFactor);
+      await this.flyToRectangle(rect, 0.5);
+      await this.waitOnePostRender();
+
+      this.forceClusterRefresh();
+      await this.waitOnePostRender();
+
+      if (minPx - prevMinPx < 1) break; // avoid over-zoom loops
+      prevMinPx = minPx;
+    }
+  }
+
+  private shrinkRectangle(rect: Rectangle, factor: number): Rectangle {
+    const cx = (rect.west + rect.east) / 2;
+    const cy = (rect.south + rect.north) / 2;
+    const hw = (rect.east - rect.west) * 0.5 * factor;
+    const hh = (rect.north - rect.south) * 0.5 * factor;
+    return new Rectangle(cx - hw, cy - hh, cx + hw, cy + hh);
+  }
+
+  private flyToRectangle(rect: Rectangle, duration = 0.8): Promise<void> {
+    return new Promise<void>((resolve) => {
+      try {
+        this.viewer.camera.flyTo({
+          destination: rect,
+          duration,
+          complete: () => resolve(),
+          cancel: () => resolve(),
+        });
+      } catch {
+        resolve();
+      }
+    });
+  }
+
+  private waitOnePostRender(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const scene = this.viewer.scene;
+      const remove = scene.postRender.addEventListener(() => {
+        remove();
+        resolve();
+      });
+      scene.requestRender();
+    });
+  }
+
+  private minPixelSeparation(entities: Entity[]): number {
+    const scene = this.viewer.scene;
+    const now = JulianDate.now();
+    const pts: Cartesian2[] = [];
+
+    for (const e of entities) {
+      const pos = (e as any).position?.getValue?.(now);
+      if (!pos) continue;
+      const win = SceneTransforms.worldToWindowCoordinates(scene, pos);
+      if (win) pts.push(win);
+    }
+    if (pts.length < 2) return Infinity;
+
+    let min = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        const dx = pts[i].x - pts[j].x;
+        const dy = pts[i].y - pts[j].y;
+        const d = Math.hypot(dx, dy);
+        if (d < min) min = d;
+      }
+    }
+    return min;
+  }
+
+  // ---------- Utilities ----------
+
+  private clusterKeyFrom(anyId: unknown): ClusterKey {
+    if (!anyId) return '';
+    if ((anyId as Entity)?.id) return String((anyId as Entity).id);
+    return String(anyId as any);
+  }
+
+  private forceClusterRefresh(): void {
+    const c = this.dataSource.clustering;
+    const prev = c.pixelRange;
+    c.pixelRange = prev === 0 ? 1 : 0;
+    c.pixelRange = prev;
+    this.viewer.scene.requestRender();
+  }
+
+  private onDpiChange = () => {
+    const now = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+    if (now !== this.dpi) {
+      this.dpi = now;
+      this.forceClusterRefresh();
+    }
+  };
+}
