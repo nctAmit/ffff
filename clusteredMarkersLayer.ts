@@ -1,5 +1,3 @@
-// ClusteredMarkersLayer.ts
-
 import {
   Cartesian2,
   Cartesian3,
@@ -17,52 +15,8 @@ import {
   VerticalOrigin,
   Viewer,
 } from 'cesium';
-import { CycleData, MarkerData } from './marker.model';
-
-
-export interface PillStyle {
-  fontFamily: string;
-  fontPx: number;
-  paddingX: number;
-  paddingY: number;
-  backgroundColor: string;
-  textColor: string;
-  separatorColor: string;
-  dotDiameterPx: number;
-  dotGapPx: number;
-  loadDotColor: string;
-  dumpDotColor: string;
-}
-
-export interface ClusteredMarkersOptions {
-  enabled?: boolean;
-  pixelRange?: number;
-  minimumClusterSize?: number;
-  labelPrefix?: string;
-  pointPixelSize?: number;
-  getPointColor?: (evt: CycleData) => Color;
-
-  pillStyle?: PillStyle;
-
-  autoZoom?: boolean;
-
-  // Callbacks
-  onMarkerClick?: (args: { entity: Entity; event?: CycleData; lat: number; lon: number }) => void;
-  onClusterClick?: (args: { clusterEntity: Entity; members: Entity[]; lat: number; lon: number }) => void;
-
-  dataSourceName?: string;
-
-  // Decluster zoom config
-  ensureDeclusterOnClick?: boolean;
-  minSeparationPx?: number;
-  maxZoomIters?: number;
-  mixedExtraZoomFactor?: number;
-  singleExtraZoomFactor?: number;
-
-  // Popup config
-  popupEnabled?: boolean;
-  buildPopupHtml?: (evt: CycleData, entity: Entity) => string;
-}
+import { ClusterBadgeStyle, ClusterCat, ClusteredMarkersOptions, ClusterKey, MarkerData } from './marker.model';
+import { formatDateToIST, formatSecondsToMinSec } from './markerUtils';
 
 export class ClusteredMarkersLayer {
   public readonly viewer: Viewer;
@@ -71,7 +25,7 @@ export class ClusteredMarkersLayer {
 
   private clickHandler?: ScreenSpaceEventHandler;
   private markerIds = new Set<string>();
-  private clusterMembers = new Map<any, Entity[]>();
+  private clusterMembers = new Map<ClusterKey, Entity[]>();
 
   private clusterStyler: (clusteredEntities: Entity[], cluster: any) => void;
 
@@ -80,30 +34,35 @@ export class ClusteredMarkersLayer {
   private popupTrackUnsub?: () => void;
   private carousel?: { entities: Entity[]; index: number; anchor: Entity };
 
+  private dpi = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+  private trackingAttached = false;
+
+  // camera-height-based clustering toggle
+  private postRenderUnsub?: () => void;
+  private clusteringRuntimeEnabled = true;
+
   constructor(viewer: Viewer, data: MarkerData[], options?: ClusteredMarkersOptions) {
     this.viewer = viewer;
 
     const defaults: Required<ClusteredMarkersOptions> = {
       enabled: true,
-      pixelRange: 60,
+      pixelRange: 200,
       minimumClusterSize: 2,
-      labelPrefix: 'L',
-      pointPixelSize: 10,
-      getPointColor: (evt: CycleData) => {
-        return Color.fromBytes(evt.color.r, evt.color.g, evt.color.b, 255);
-      },
-      pillStyle: {
+      pointPixelSize: 12.5,
+      getPointColor: (popup) => Color.fromCssColorString((popup?.['color'] as string) || '#1976d2'),
+      badgeStyle: {
         fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-        fontPx: 18,
-        paddingX: 12,
-        paddingY: 6,
+        fontPx: 12,
+        paddingX: 8,
+        paddingY: 8,
+        rowGapPx: 4,
         backgroundColor: 'whitesmoke',
         textColor: '#000000',
         separatorColor: '#000000',
-        dotDiameterPx: 10,
+        borderColor: '#000000',
+        borderWidth: 1,
+        dotDiameterPx: 6,
         dotGapPx: 6,
-        loadDotColor: 'rgb(152, 38, 222)',
-        dumpDotColor: 'rgb(254, 90, 171)',
       },
       autoZoom: true,
       onMarkerClick: () => { },
@@ -116,6 +75,7 @@ export class ClusteredMarkersLayer {
       singleExtraZoomFactor: 0.9,
       popupEnabled: true,
       buildPopupHtml: undefined as any,
+      minCameraHeightForClustering: 15,
     };
 
     this.options = { ...defaults, ...(options || {}) };
@@ -126,20 +86,14 @@ export class ClusteredMarkersLayer {
     this.dataSource = new CustomDataSource(this.options.dataSourceName);
     void this.viewer.dataSources.add(this.dataSource);
 
-    // Cluster styler → L / D / Mixed pill
+    // Cluster styler → dynamically handle categories and per-bucket dot colors (mode of member colors)
     this.clusterStyler = (clusteredEntities, cluster) => {
-      const { load, dump } = this.getLoadDumpCounts(clusteredEntities);
+      const buckets = this.buildBuckets(clusteredEntities);
+      const rows = this.buildRowsForBuckets(buckets); // {label, count, dotCss}
 
       cluster.label.show = false;
 
-      let out: { canvas: HTMLCanvasElement; cssWidth: number; cssHeight: number };
-      if (load > 0 && dump === 0) {
-        out = this.getClusterSingleCanvas('L', load, this.options.pillStyle);
-      } else if (dump > 0 && load === 0) {
-        out = this.getClusterSingleCanvas('D', dump, this.options.pillStyle);
-      } else {
-        out = this.getClusterMixedCanvas({ load, dump }, this.options.pillStyle);
-      }
+      const out = this.drawClusterVerticalBadge(rows, this.options.badgeStyle);
 
       cluster.billboard.show = true;
       cluster.billboard.image = out.canvas.toDataURL('image/png');
@@ -147,13 +101,12 @@ export class ClusteredMarkersLayer {
       cluster.billboard.width = out.cssWidth;
       cluster.billboard.height = out.cssHeight;
 
-      // unify picking
+      // unify picking & store members with a stable key
       const sharedId = cluster.label.id;
+      const key = this.clusterKeyFrom(sharedId);
       cluster.billboard.id = sharedId;
       if (cluster.point) cluster.point.id = sharedId;
-
-      // store members
-      this.clusterMembers.set(sharedId, clusteredEntities);
+      this.clusterMembers.set(key, clusteredEntities);
     };
 
     this.setData(data);
@@ -169,7 +122,19 @@ export class ClusteredMarkersLayer {
         if (e.key === 'ArrowRight') this.carouselNext();
       }
     });
+
+    // crisp badges on DPR changes
+    window.addEventListener('resize', this.onDpiChange);
+    try {
+      window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`)?.addEventListener?.('change', this.onDpiChange);
+    } catch { }
+
+    // camera-height based clustering toggle
+    const remove = this.viewer.scene.postRender.addEventListener(() => this.updateClusteringByCameraHeight());
+    this.postRenderUnsub = () => remove();
   }
+
+  // ---------- Public API ----------
 
   public setData(markers: MarkerData[]): void {
     this.clusterMembers.clear();
@@ -177,22 +142,33 @@ export class ClusteredMarkersLayer {
     this.dataSource.entities.removeAll();
 
     for (const marker of markers) {
-      if (!isFinite(marker.point.lat) || !isFinite(marker.point.lng)) continue;
-      const position = Cartesian3.fromDegrees(marker.point.lng, marker.point.lat, 0);
+      const { lat, lng } = marker.point;
+      if (!isFinite(lat) || !isFinite(lng)) continue;
+      const position = Cartesian3.fromDegrees(lng, lat, 0);
 
       const entity = this.dataSource.entities.add({
         position,
         point: {
-          pixelSize: 8,
+          pixelSize: this.options.pointPixelSize,
           color: Color.fromCssColorString(marker.options.color),
           outlineColor: Color.WHITESMOKE,
           outlineWidth: 2,
         },
       });
 
-      // store JSON for popup
-      entity.properties = new PropertyBag(marker.popupData as any);
-      (entity as any).__event = marker.popupData;
+      // store JSON for popup & classification & dynamic dot color
+      const pd: Record<string, any> = {
+        ...marker.popupData,
+        color: marker.options.color,          // used as the per-marker dot color
+        segmentDesc: marker.popupData?.['segmentDesc'] ?? null,
+        subState: marker.popupData?.['subState'] ?? null,
+      };
+
+      entity.properties = new PropertyBag(pd as any);
+      (entity as any).__popup = pd;
+      (entity as any).__cat = this.classify(pd);
+      (entity as any).__dotColor = String(marker.options.color || '#000000');
+      (entity as any).__icon = marker.options.icon;
 
       this.markerIds.add(entity.id);
     }
@@ -232,21 +208,180 @@ export class ClusteredMarkersLayer {
     this.clusterMembers.clear();
     this.markerIds.clear();
     this.hidePopup();
+
+    window.removeEventListener('resize', this.onDpiChange);
+    try {
+      window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`)?.removeEventListener?.('change', this.onDpiChange);
+    } catch { }
+
+    if (this.postRenderUnsub) this.postRenderUnsub();
   }
 
-  // ----------------------
-  // Click handling
-  // ----------------------
+  public refreshClusterBadges(): void {
+    this.forceClusterRefresh();
+  }
+
+  // ---------- Classification ----------
+
+  private classify(popup: Record<string, any>): ClusterCat {
+    const seg = String(popup?.['segmentDesc'] ?? '').trim().toLowerCase();
+    if (seg === 'load') return 'L';
+    if (seg === 'dump') return 'D';
+
+    const sub = String(popup?.['subState'] ?? '').trim().toLowerCase();
+    switch (sub) {
+      case 'working': return 'W';
+      case 'productive idling': return 'PL';
+      case 'short idling': return 'SI';
+      case 'medium idling': return 'MI';
+      case 'long idling': return 'LI';
+      case 'engine stop': return 'ES';
+      default: return 'SI'; // safe fallback
+    }
+  }
+
+  // ---------- Bucketing with dynamic dot colors ----------
+
+  private buildBuckets(entities: Entity[]): {
+    counts: Record<ClusterCat, number>;
+    // representative color per bucket (mode of marker colors)
+    dotCss: Partial<Record<ClusterCat, string>>;
+  } {
+    const counts: Record<ClusterCat, number> = { L: 0, D: 0, PL: 0, SI: 0, LI: 0, MI: 0, W: 0, ES: 0 };
+    const colorCounts: Partial<Record<ClusterCat, Map<string, number>>> = {};
+    const now = JulianDate.now();
+
+    for (const e of entities) {
+      const pd: Record<string, any> | undefined = (e as any).__popup ?? (e.properties as any)?.getValue?.(now);
+      const cat: ClusterCat = (e as any).__cat ?? this.classify(pd || {});
+      counts[cat] = (counts[cat] || 0) + 1;
+
+      const cssCol = String((e as any).__dotColor || pd?.['color'] || '#000000');
+      const map = (colorCounts[cat] ??= new Map<string, number>());
+      map.set(cssCol, (map.get(cssCol) || 0) + 1);
+    }
+
+    const dotCss: Partial<Record<ClusterCat, string>> = {};
+    (Object.keys(counts) as ClusterCat[]).forEach((cat) => {
+      const map = colorCounts[cat];
+      if (!map || map.size === 0) return;
+      let best = '#000000';
+      let bestN = -1;
+      for (const [col, n] of map) {
+        if (n > bestN) { bestN = n; best = col; }
+      }
+      dotCss[cat] = best;
+    });
+
+    return { counts, dotCss };
+  }
+
+  private buildRowsForBuckets(b: {
+    counts: Record<ClusterCat, number>;
+    dotCss: Partial<Record<ClusterCat, string>>;
+  }): Array<{ label: string; count: number; dotCss: string }> {
+    // deterministic vertical order
+    const order: ClusterCat[] = ['L', 'D', 'W', 'PL', 'SI', 'MI', 'LI', 'ES'];
+
+    const rows: Array<{ label: string; count: number; dotCss: string }> = [];
+    for (const cat of order) {
+      const count = b.counts[cat] || 0;
+      if (count <= 0) continue;
+      rows.push({
+        label: cat,
+        count,
+        dotCss: b.dotCss[cat] ?? '#000000',
+      });
+    }
+    return rows;
+  }
+
+  // ---------- Cluster badge drawing (VERTICAL RECTANGLE) ----------
+
+  private drawClusterVerticalBadge(
+    rows: Array<{ label: string; count: number; dotCss: string }>,
+    style: ClusterBadgeStyle
+  ): { canvas: HTMLCanvasElement; cssWidth: number; cssHeight: number } {
+    const ctxMeasure = document.createElement('canvas').getContext('2d')!;
+    ctxMeasure.font = `${style.fontPx}px`;
+
+    const dot = style.dotDiameterPx;
+    const gap = style.dotGapPx;
+    const rowGap = style.rowGapPx;
+
+    const texts = rows.map((r) => `${r.label} ${r.count}`);
+    const textWidths = texts.map((t) => ctxMeasure.measureText(t).width);
+
+    // Width governed by the widest row: dot + gap + text
+    const contentWidth = Math.max(...textWidths.map((w) => dot + gap + w), 0);
+    // Height = N * rowHeight + gaps between rows
+    const rowHeight = style.fontPx; // text middle aligns within row
+    const contentHeight = rows.length > 0
+      ? rows.length * rowHeight + (rows.length - 1) * rowGap
+      : rowHeight;
+
+    const cssWidth = Math.ceil(contentWidth + style.paddingX * 2);
+    const cssHeight = Math.ceil(contentHeight + style.paddingY * 2);
+
+    const dpr = this.dpi;
+    const canvas = document.createElement('canvas');
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+
+    const ctx = canvas.getContext('2d')!;
+    ctx.scale(dpr, dpr);
+
+    // Background rectangle (no rounded corners)
+    ctx.fillStyle = style.backgroundColor;
+    ctx.fillRect(0.5, 0.5, cssWidth - 1, cssHeight - 1);
+
+    // 1px border
+    ctx.strokeStyle = style.borderColor;
+    ctx.lineWidth = style.borderWidth;
+    ctx.strokeRect(0.5, 0.5, cssWidth - 1, cssHeight - 1);
+
+    ctx.font = `${style.fontPx}px`;
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = style.textColor;
+
+    let y = style.paddingY + rowHeight / 2;
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+
+      // Dot (left side)
+      const cx = style.paddingX + dot / 2;
+      ctx.fillStyle = r.dotCss;
+      ctx.beginPath();
+      ctx.arc(cx, y, dot / 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Text
+      ctx.fillStyle = style.textColor;
+      ctx.fillText(texts[i], style.paddingX + dot + gap, y + 0.5);
+
+      // 1px border
+      ctx.strokeStyle = style.borderColor;
+      ctx.lineWidth = style.borderWidth;
+      ctx.strokeRect(0.5, 0.5, cssWidth - 1, cssHeight - 1);
+
+      y += rowHeight;
+      if (i < rows.length - 1) y += rowGap;
+    }
+
+    return { canvas, cssWidth, cssHeight };
+  }
+
+  // ---------- Click handling / popups ----------
 
   private installClickHandler(): void {
     this.clickHandler?.destroy();
     this.clickHandler = new ScreenSpaceEventHandler(this.viewer.scene.canvas);
 
     // LEFT CLICK
-    this.clickHandler.setInputAction(async (movement) => {
+    this.clickHandler.setInputAction(async (movement: { position: Cartesian2; }) => {
       const picked = this.viewer.scene.pick(movement.position);
 
-      // If clicked on EMPTY SPACE: close popup and return
       if (!picked || !picked.id) {
         this.hidePopup();
         return;
@@ -254,7 +389,7 @@ export class ClusteredMarkersLayer {
 
       const entity = picked.id as Entity;
       const now = JulianDate.now();
-      const pos = (entity as any).position?.getValue?.(now);
+      const pos = picked.primitive?.position;
       if (!pos) {
         this.hidePopup();
         return;
@@ -263,52 +398,49 @@ export class ClusteredMarkersLayer {
       const carto = Cartographic.fromCartesian(pos);
       const lat = CesiumMath.toDegrees(carto.latitude);
       const lon = CesiumMath.toDegrees(carto.longitude);
+      const key = this.clusterKeyFrom(picked.id);
 
-      const key = picked.id;
-
-      // --- Cluster clicked ---
+      // Cluster clicked
       if (this.clusterMembers.has(key)) {
         const members = this.clusterMembers.get(key)!;
-        console.log(members);
-
-        const { load, dump } = this.getLoadDumpCounts(members);
 
         if (this.options.onClusterClick) {
           this.options.onClusterClick({ clusterEntity: entity, members, lat, lon });
         }
 
         if (this.options.ensureDeclusterOnClick) {
-          const isMixed = load > 0 && dump > 0;
+          const buckets = this.buildBuckets(members).counts;
+          const nonZero = Object.values(buckets).filter((n) => n > 0).length;
+          const perStep = nonZero > 1 ? this.options.mixedExtraZoomFactor : this.options.singleExtraZoomFactor;
+
           await this.zoomToSeparate(members, {
             targetMinPx: this.options.minSeparationPx,
             maxSteps: this.options.maxZoomIters,
-            perStepFactor: isMixed ? this.options.mixedExtraZoomFactor : this.options.singleExtraZoomFactor,
+            perStepFactor: perStep,
           });
         } else {
           await this.zoomToEntitiesOnce(members);
         }
 
-        // Hide popup when zooming to clusters
         this.hidePopup();
         return;
       }
 
-      // --- Single marker clicked ---
+      // Single marker clicked
       if (entity.id && this.markerIds.has(entity.id)) {
-        const evt: CycleData | undefined = (entity as any).__event;
+        const evt: Record<string, any> | undefined = (entity as any).__popup;
 
         if (this.options.onMarkerClick) {
           this.options.onMarkerClick({ entity, event: evt, lat, lon });
         }
 
-        // Drill for same-place markers
         const picks = this.viewer.scene.drillPick(movement.position) as any[];
         const now2 = JulianDate.now();
         const refPos = (entity as any).position?.getValue?.(now2);
 
         const allMarkerEntities = picks
           .map((p) => p?.id as Entity)
-          .filter((e): e is Entity => !!e && !!(e as any).__event && this.markerIds.has(e.id));
+          .filter((e): e is Entity => !!e && !!(e as any).__popup && this.markerIds.has(e.id));
 
         const samePlace: Entity[] = [];
         for (const e of allMarkerEntities) {
@@ -318,7 +450,6 @@ export class ClusteredMarkersLayer {
         }
 
         if (samePlace.length > 1) {
-          // Show carousel anchored at clicked entity
           this.showCarouselPopup(samePlace, entity);
         } else if (this.options.popupEnabled) {
           const html = this.options.buildPopupHtml
@@ -329,7 +460,6 @@ export class ClusteredMarkersLayer {
         return;
       }
 
-      // If some other non-marker primitive: close popup
       this.hidePopup();
     }, ScreenSpaceEventType.LEFT_CLICK);
 
@@ -337,51 +467,217 @@ export class ClusteredMarkersLayer {
     this.clickHandler.setInputAction(() => this.hidePopup(), ScreenSpaceEventType.RIGHT_CLICK);
   }
 
-  /**
-   * Force cluster rebuild (EntityCluster has no recluster() public API)
-   */
-  private forceClusterRefresh(): void {
-    const c = this.dataSource.clustering;
-    const prev = c.pixelRange;
-    c.pixelRange = prev === 0 ? 1 : 0;
-    c.pixelRange = prev;
-    this.viewer.scene.requestRender();
+  private ensurePopupEl(): void {
+    if (this.popupEl) return;
+    const el = document.createElement('div');
+    el.className = 'cm-popup';
+    Object.assign(el.style, {
+      position: 'absolute',
+      display: 'none',
+      zIndex: '1000',
+      background: '#fff',
+      color: '#111',
+      padding: '10px 12px',
+      transform: 'translate(-50% -150%)',
+      borderRadius: '6px',
+      boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
+      pointerEvents: 'auto',
+      maxWidth: '320px',
+      fontSize: '12px',
+      lineHeight: '1.4',
+      border: '1px solid #e8e8e8',
+    } as CSSStyleDeclaration);
+    this.viewer.container.appendChild(el);
+    this.popupEl = el;
   }
 
-  private getInitials(phrase) {
-    // Split the phrase into words
-    const words = phrase.trim().split(/\s+/);
-    // Get the first letter of each word and join them in uppercase
-    const initials = words.map(word => word[0].toUpperCase()).join('');
-    return initials;
+  private enablePopupTracking(): void {
+    if (this.trackingAttached) return;
+    this.disablePopupTracking();
+    const anchor = this.carousel?.anchor ?? this.popupAnchor;
+    if (!anchor) return;
+    const scene = this.viewer.scene;
+    const tick = () => this.positionPopupAt(anchor);
+    const remove = scene.postRender.addEventListener(tick);
+    this.popupTrackUnsub = () => { remove(); this.trackingAttached = false; };
+    this.trackingAttached = true;
   }
 
+  private disablePopupTracking(): void {
+    if (this.popupTrackUnsub) this.popupTrackUnsub();
+    this.popupTrackUnsub = undefined;
+    this.trackingAttached = false;
+  }
 
-  private getLoadDumpCounts(entities: Entity[]): { load: number; dump: number } {
-    console.log(entities);
+  private positionPopupAt(entity: Entity): void {
+    if (!this.popupEl) return;
+    const now = JulianDate.now();
+    const pos = (entity as any).position?.getValue?.(now);
+    if (!pos) return;
+    const win = SceneTransforms.worldToWindowCoordinates(this.viewer.scene, pos);
+    if (!win) return;
 
-    let load = 0, dump = 0;
-    for (const e of entities) {
-      const evt = (e as any).__event;
-      console.log(evt)
-      if (evt['segmentDesc']) {
-        const seg = (evt['segmentDesc'] || '').toLowerCase();
-        if (seg.includes('load')) load++;
-        else if (seg.includes('dump')) dump++;
-      }
+    const pad = 12;
+    const el = this.popupEl;
+    const container = this.viewer.container;
 
+    let left = win.x + pad;
+    let top = win.y - pad;
 
+    const maxLeft = container.clientWidth - el.offsetWidth - pad;
+    const maxTop = container.clientHeight - el.offsetHeight - pad;
+
+    left = Math.max(pad, Math.min(left, maxLeft));
+    top = Math.max(pad, Math.min(top, maxTop));
+
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }
+
+  private showPopupAt(entity: Entity, html: string): void {
+    this.ensurePopupEl();
+    if (!this.popupEl) return;
+    this.carousel = undefined;
+    this.popupAnchor = entity;
+    this.popupEl.innerHTML = html;
+    this.popupEl.style.display = 'block';
+    this.positionPopupAt(entity);
+    this.enablePopupTracking();
+  }
+
+  private hidePopup(): void {
+    if (this.popupEl) this.popupEl.style.display = 'none';
+    this.carousel = undefined;
+    this.popupAnchor = undefined;
+    this.disablePopupTracking();
+  }
+
+  private showCarouselPopup(entities: Entity[], anchor: any): void {
+    this.ensurePopupEl();
+    if (!this.popupEl) return;
+
+    this.carousel = { entities, index: 0, anchor };
+    this.popupAnchor = undefined;
+
+    this.popupEl.innerHTML = `
+      <div style="display:flex; align-items:center; gap:8px;">
+        <div class="cm-prev" title="Previous" style="border:1px solid #ddd; background:#f9f9f9; border-radius:50%; padding:6px 9px 0; cursor:pointer;width:40px;transform: translate(-25px, 10px);">
+            <span style="width:32px;font-size:30px;line-height:0.3;margin-left:2px">
+              &#8249; 
+            </span>
+          </div>
+        <div class="cm-content" style="flex:1; min-width:220px;"></div>
+        <div class="cm-next" title="Next" style="
+          border:1px solid #ddd; background:#f9f9f9; border-radius:50%; padding:6px 9px 0; cursor:pointer;width:40px;transform: translate(25px, 10px);">
+            <span style="width:32px;font-size:30px;line-height:0.3;margin-right:2px">
+              &#8250; 
+            </span>          </div>
+          <div style="position:absolute; bottom:-10px; left:50%; transform:translateX(-50%); width:0; height:0; border-left:10px solid transparent; border-right:10px solid transparent; border-top:10px solid white;"></div>
+      </div>
+      <div class="cm-indicator" style="margin-top:6px; text-align:center; color:#666; font-weight:600;"></div>
+
+    `;
+    this.popupEl.style.display = 'block';
+
+    const prevBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-prev')!;
+    const nextBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-next')!;
+    prevBtn.onclick = () => this.carouselPrev();
+    nextBtn.onclick = () => this.carouselNext();
+
+    this.renderCarouselSlide();
+    this.positionPopupAt(anchor);
+    this.enablePopupTracking();
+  }
+
+  private carouselPrev(): void {
+    if (!this.carousel) return;
+    const n = this.carousel.entities.length;
+    this.carousel.index = (this.carousel.index - 1 + n) % n;
+    this.renderCarouselSlide();
+  }
+
+  private carouselNext(): void {
+    if (!this.carousel) return;
+    const n = this.carousel.entities.length;
+    this.carousel.index = (this.carousel.index + 1) % n;
+    this.renderCarouselSlide();
+  }
+
+  private renderCarouselSlide(): void {
+    if (!this.carousel || !this.popupEl) return;
+    const { entities, index, anchor } = this.carousel;
+
+    const e = entities[index];
+    const now = JulianDate.now();
+    const pos = (e as any).position?.getValue?.(now);
+    const carto = pos ? Cartographic.fromCartesian(pos) : undefined;
+    const lat = carto ? CesiumMath.toDegrees(carto.latitude) : NaN;
+    const lon = carto ? CesiumMath.toDegrees(carto.longitude) : NaN;
+
+    const evt: Record<string, any> | undefined = (e as any).__popup;
+    const html = this.options.buildPopupHtml
+      ? this.options.buildPopupHtml(evt!, e)
+      : this.buildDefaultPopupHtml(evt!, lat, lon);
+
+    const content = this.popupEl.querySelector<HTMLDivElement>('.cm-content')!;
+    const indicator = this.popupEl.querySelector<HTMLDivElement>('.cm-indicator')!;
+    content.innerHTML = html;
+    indicator.textContent = `${index + 1} / ${entities.length}`;
+
+    this.positionPopupAt(anchor);
+  }
+
+  private buildDefaultPopupHtml(evt: Record<string, any> | undefined, lat: number, lon: number): string {
+    if (!evt) {
+      return `<div><strong>Marker</strong><br/>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}</div>`;
     }
-    return { load, dump };
+
+    const rows = evt['subState'] ?
+      `
+          <div style="display:flex;gap:8px;margin:5px 0;">
+            <div style="min-width:120px;color:#666;">Fuel Burn</div>
+            <div style="flex:1;font-weight:600;">${evt['fuelConsumption']} gal</div>
+          </div>
+          <div style="display:flex;gap:8px;margin:5px 0;">
+            <div style="min-width:120px;color:#666;">${evt['subState'].replace(/Idling$/, 'Idle Events')}</div>
+            <div style="flex:1;font-weight:600;">${formatSecondsToMinSec(+evt['duration'])}</div>
+          </div>
+        `: `
+          <div style="display:flex;gap:8px;margin:5px 0;">
+            <div style="min-width:120px;">Payload</div>
+            <div style="flex:1;font-weight:600;">${evt['payload']} ton</div>
+          </div>
+          <div style="display:flex;gap:8px;margin:5px 0;">
+            <div style="min-width:120px;">Hauler ${evt['segmentDesc']} Time</div>
+            <div style="flex:1;font-weight:600;">${formatSecondsToMinSec(+evt['cycleDuration'])}</div>
+          </div>
+        `;
+
+    return `
+    <div>
+      <div style=margin-bottom:6px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <img style="width:60px" src="/assets/images/asset-default.svg"/>
+          <div>
+          <p style="margin:0;font-weight: 500;">${evt['equipmentId']}</p>
+          <p style="margin:0;">${evt['serialNumber']} - ${evt['make']}</p>
+          </div>
+        </div>
+        <div style="position:relative;text-align:center;margin:8px 0;">
+          <hr style="border:none;border-top:1px solid #eee;" />
+          <p style="position:absolute;top:-5px;left:50%;transform:translateX(-50%);background:#fff;font-size:10px;">
+            ${formatDateToIST(evt['endTime'] || evt['machineEndTime'])}
+          </p>
+        </div>
+      </div>
+      ${rows}
+    </div>
+  `;
   }
 
-  // ----------------------
-  // Zoom helpers
-  // ----------------------
+  // ---------- Zoom helpers ----------
 
-  private rectangleFromEntities(entities: Entity): Rectangle;
-  private rectangleFromEntities(entities: Entity[]): Rectangle;
-  private rectangleFromEntities(entities: Entity | Entity[]): Rectangle {
+  private rectangleFromEntities(entities: Entity | Entity[]): Rectangle | undefined {
     const arr = Array.isArray(entities) ? entities : [entities];
     const now = JulianDate.now();
     const cartos: Cartographic[] = [];
@@ -390,7 +686,7 @@ export class ClusteredMarkersLayer {
       if (!p) continue;
       cartos.push(Cartographic.fromCartesian(p));
     }
-    if (cartos.length === 0) return undefined as any;
+    if (cartos.length === 0) return undefined;
 
     const rect = Rectangle.fromCartographicArray(cartos);
     if (rect.west === rect.east && rect.north === rect.south) {
@@ -421,9 +717,10 @@ export class ClusteredMarkersLayer {
     let rect = this.rectangleFromEntities(entities);
     if (!rect) return;
 
-    await this.flyToRectangle(rect, 0.8);
+    await this.flyToRectangle(rect, 0.2);
     await this.waitOnePostRender();
 
+    let prevMinPx = this.minPixelSeparation(entities);
     for (let step = 0; step < maxSteps; step++) {
       const minPx = this.minPixelSeparation(entities);
       if (minPx === Infinity || minPx >= targetMinPx) break;
@@ -434,6 +731,9 @@ export class ClusteredMarkersLayer {
 
       this.forceClusterRefresh();
       await this.waitOnePostRender();
+
+      if (minPx - prevMinPx < 1) break;
+      prevMinPx = minPx;
     }
   }
 
@@ -445,7 +745,7 @@ export class ClusteredMarkersLayer {
     return new Rectangle(cx - hw, cy - hh, cx + hw, cy + hh);
   }
 
-  private flyToRectangle(rect: Rectangle, duration = 0.8): Promise<void> {
+  private flyToRectangle(rect: Rectangle, duration = 0.2): Promise<void> {
     return new Promise<void>((resolve) => {
       try {
         this.viewer.camera.flyTo({
@@ -496,313 +796,45 @@ export class ClusteredMarkersLayer {
     return min;
   }
 
-  // ----------------------
-  // Popup + Carousel
-  // ----------------------
+  // ---------- Camera-height based clustering toggle ----------
 
-  private ensurePopupEl(): void {
-    if (this.popupEl) return;
-    const el = document.createElement('div');
-    el.className = 'cm-popup';
-    Object.assign(el.style, {
-      position: 'absolute',
-      display: 'none',
-      zIndex: '1000',
-      background: '#fff',
-      color: '#111',
-      padding: '10px 12px',
-      borderRadius: '8px',
-      boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
-      pointerEvents: 'auto',
-      maxWidth: '320px',
-      fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-      fontSize: '12px',
-      lineHeight: '1.4',
-      border: '1px solid #e8e8e8',
-    } as CSSStyleDeclaration);
-    this.viewer.container.appendChild(el);
-    this.popupEl = el;
-  }
+  private updateClusteringByCameraHeight(): void {
+    const cameraCarto = Cartographic.fromCartesian(this.viewer.camera.position);
+    const height = cameraCarto?.height ?? Number.POSITIVE_INFINITY;
 
-  private enablePopupTracking(): void {
-    this.disablePopupTracking();
-    const anchor = this.carousel?.anchor ?? this.popupAnchor;
-    if (!anchor) return;
-    const scene = this.viewer.scene;
-    const tick = () => this.positionPopupAt(anchor);
-    const remove = scene.postRender.addEventListener(tick);
-    this.popupTrackUnsub = remove;
-  }
+    const shouldCluster = height >= this.options.minCameraHeightForClustering;
+    if (shouldCluster !== this.clusteringRuntimeEnabled) {
+      this.clusteringRuntimeEnabled = shouldCluster;
 
-  private disablePopupTracking(): void {
-    if (this.popupTrackUnsub) {
-      this.popupTrackUnsub();
-      this.popupTrackUnsub = undefined;
+      const clustering = this.dataSource.clustering;
+      clustering.enabled = shouldCluster && this.options.enabled;
+
+      // force recluster/revert immediately
+      this.forceClusterRefresh();
     }
   }
 
-  private positionPopupAt(entity: Entity): void {
-    if (!this.popupEl) return;
-    const now = JulianDate.now();
-    const pos = (entity as any).position?.getValue?.(now);
-    if (!pos) return;
-    const win = SceneTransforms.worldToWindowCoordinates(this.viewer.scene, pos);
-    if (!win) return;
-    this.popupEl.style.left = `${win.x + 12}px`;
-    this.popupEl.style.top = `${win.y - 12}px`;
+  // ---------- Utilities ----------
+
+  private clusterKeyFrom(anyId: unknown): ClusterKey {
+    if (!anyId) return '';
+    if ((anyId as Entity)?.id) return String((anyId as Entity).id);
+    return String(anyId as any);
   }
 
-  private showPopupAt(entity: Entity, html: string): void {
-    this.ensurePopupEl();
-    if (!this.popupEl) return;
-    this.carousel = undefined;
-    this.popupAnchor = entity;
-    this.popupEl.innerHTML = html;
-    this.popupEl.style.display = 'block';
-    this.positionPopupAt(entity);
-    this.enablePopupTracking();
+  private forceClusterRefresh(): void {
+    const c = this.dataSource.clustering;
+    const prev = c.pixelRange;
+    c.pixelRange = prev === 0 ? 1 : 0;
+    c.pixelRange = prev;
+    this.viewer.scene.requestRender();
   }
 
-  private hidePopup(): void {
-    if (this.popupEl) this.popupEl.style.display = 'none';
-    this.carousel = undefined;
-    this.popupAnchor = undefined;
-    this.disablePopupTracking();
-  }
-
-  private showCarouselPopup(entities: Entity[], anchor: Entity): void {
-    this.ensurePopupEl();
-    if (!this.popupEl) return;
-
-    this.carousel = { entities, index: 0, anchor };
-    this.popupAnchor = undefined; // carousel uses its own anchor
-
-    this.popupEl.innerHTML = `
-      <div style="display:flex; align-items:center; gap:8px;">
-        <button class="cm-prev" title="Previous" style="
-          border:1px solid #ddd; background:#f9f9f9; border-radius:6px; padding:6px 8px; cursor:pointer;">◀</button>
-        <div class="cm-content" style="flex:1; min-width:220px;"></div>
-        <button class="cm-next" title="Next" style="
-          border:1px solid #ddd; background:#f9f9f9; border-radius:6px; padding:6px 8px; cursor:pointer;">▶</button>
-      </div>
-      <div class="cm-indicator" style="margin-top:6px; text-align:center; color:#666; font-weight:600;"></div>
-    `;
-    this.popupEl.style.display = 'block';
-
-    const prevBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-prev')!;
-    const nextBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-next')!;
-    prevBtn.onclick = () => this.carouselPrev();
-    nextBtn.onclick = () => this.carouselNext();
-
-    this.renderCarouselSlide();
-    this.positionPopupAt(anchor);
-    this.enablePopupTracking();
-  }
-
-  private carouselPrev(): void {
-    if (!this.carousel) return;
-    const n = this.carousel.entities.length;
-    this.carousel.index = (this.carousel.index - 1 + n) % n;
-    this.renderCarouselSlide();
-  }
-
-  private carouselNext(): void {
-    if (!this.carousel) return;
-    const n = this.carousel.entities.length;
-    this.carousel.index = (this.carousel.index + 1) % n;
-    this.renderCarouselSlide();
-  }
-
-  private renderCarouselSlide(): void {
-    if (!this.carousel || !this.popupEl) return;
-    const { entities, index, anchor } = this.carousel;
-
-    const e = entities[index];
-    const now = JulianDate.now();
-    const pos = (e as any).position?.getValue?.(now);
-    const carto = pos ? Cartographic.fromCartesian(pos) : undefined;
-    const lat = carto ? CesiumMath.toDegrees(carto.latitude) : NaN;
-    const lon = carto ? CesiumMath.toDegrees(carto.longitude) : NaN;
-
-    const evt: CycleData | undefined = (e as any).__event;
-    const html = this.options.buildPopupHtml
-      ? this.options.buildPopupHtml(evt!, e)
-      : this.buildDefaultPopupHtml(evt!, lat, lon);
-
-    const content = this.popupEl.querySelector<HTMLDivElement>('.cm-content')!;
-    const indicator = this.popupEl.querySelector<HTMLDivElement>('.cm-indicator')!;
-    content.innerHTML = html;
-    indicator.textContent = `${index + 1} / ${entities.length}`;
-
-    // keep it positioned at the carousel anchor
-    this.positionPopupAt(anchor);
-  }
-
-  private buildDefaultPopupHtml(evt: CycleData | undefined, lat: number, lon: number): string {
-    if (!evt) {
-      return `<div><strong>Marker</strong><br/>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}</div>`;
+  private onDpiChange = () => {
+    const now = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+    if (now !== this.dpi) {
+      this.dpi = now;
+      this.forceClusterRefresh();
     }
-    const rows = Object.entries(evt as any)
-      .map(([k, v]) => {
-        const val = v === null || v === undefined ? '' : String(v);
-        return `<div style="display:flex;gap:8px;margin:2px 0;">
-          <div style="min-width:120px;color:#666;">${this.escape(k)}</div>
-          <div style="flex:1;font-weight:600;">${this.escape(val)}</div>
-        </div>`;
-      })
-      .join('');
-    return `
-      <div>
-        <div style="font-weight:700;margin-bottom:6px;">Details</div>
-        ${rows}
-        <hr style="margin:8px 0;border:none;border-top:1px solid #eee;" />
-        <div style="color:#666;">Lat: ${isFinite(lat) ? lat.toFixed(6) : '-'}, Lon: ${isFinite(lon) ? lon.toFixed(6) : '-'}</div>
-      </div>
-    `;
-  }
-
-  private escape(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-
-  // ----------------------
-  // Cluster pill canvas drawing
-  // ----------------------
-
-  private getClusterSingleCanvas(
-    kind: 'L' | 'D',
-    count: number,
-    style: PillStyle
-  ): { canvas: HTMLCanvasElement; cssWidth: number; cssHeight: number } {
-    const ctxMeasure = document.createElement('canvas').getContext('2d')!;
-    ctxMeasure.font = `${style.fontPx}px ${style.fontFamily}`;
-    const text = `${kind} ${count}`;
-    const textWidth = ctxMeasure.measureText(text).width;
-
-    const dot = style.dotDiameterPx;
-    const gap = style.dotGapPx;
-
-    const innerWidth = dot + gap + textWidth;
-    const cssWidth = Math.ceil(innerWidth + style.paddingX * 2);
-    const cssHeight = Math.ceil(style.fontPx + style.paddingY * 2);
-
-    const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
-    const canvas = document.createElement('canvas');
-    canvas.width = cssWidth * dpr;
-    canvas.height = cssHeight * dpr;
-
-    const ctx = canvas.getContext('2d')!;
-    ctx.scale(dpr, dpr);
-
-    this.roundedRect(ctx, 0.5, 0.5, cssWidth - 1, cssHeight - 1, Math.min(10, cssHeight / 2 - 1), style.backgroundColor);
-
-    // Dot
-    const dotColor = kind === 'L' ? style.loadDotColor : style.dumpDotColor;
-    const cx = style.paddingX + dot / 2;
-    const cy = cssHeight / 2;
-    ctx.fillStyle = dotColor;
-    ctx.beginPath();
-    ctx.arc(cx, cy, dot / 2, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Text
-    ctx.font = `${style.fontPx}px ${style.fontFamily}`;
-    ctx.fillStyle = style.textColor;
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, style.paddingX + dot + gap, cy + 0.5);
-
-    return { canvas, cssWidth, cssHeight };
-  }
-
-  private getClusterMixedCanvas(
-    counts: { load: number; dump: number },
-    style: PillStyle
-  ): { canvas: HTMLCanvasElement; cssWidth: number; cssHeight: number } {
-    const ctxMeasure = document.createElement('canvas').getContext('2d')!;
-    ctxMeasure.font = `${style.fontPx}px ${style.fontFamily}`;
-    const textL = `L ${counts.load}`;
-    const textD = `D ${counts.dump}`;
-    const wL = ctxMeasure.measureText(textL).width;
-    const wD = ctxMeasure.measureText(textD).width;
-
-    const dot = style.dotDiameterPx;
-    const gap = style.dotGapPx;
-    const sep = Math.max(1, Math.floor(style.dotGapPx));
-
-    const leftInner = dot + gap + wL;
-    const rightInner = dot + gap + wD;
-    const innerWidth = leftInner + sep + rightInner;
-
-    const cssWidth = Math.ceil(innerWidth + style.paddingX * 2);
-    const cssHeight = Math.ceil(style.fontPx + style.paddingY * 2);
-
-    const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
-    const canvas = document.createElement('canvas');
-    canvas.width = cssWidth * dpr;
-    canvas.height = cssHeight * dpr;
-
-    const ctx = canvas.getContext('2d')!;
-    ctx.scale(dpr, dpr);
-
-    this.roundedRect(ctx, 0.5, 0.5, cssWidth - 1, cssHeight - 1, Math.min(10, cssHeight / 2 - 1), style.backgroundColor);
-
-    let x = style.paddingX;
-    const cy = cssHeight / 2;
-
-    // Left dot + text
-    ctx.fillStyle = style.loadDotColor;
-    ctx.beginPath();
-    ctx.arc(x + dot / 2, cy, dot / 2, 0, Math.PI * 2);
-    ctx.fill();
-    x += dot + gap;
-
-    ctx.font = `${style.fontPx}px ${style.fontFamily}`;
-    ctx.fillStyle = style.textColor;
-    ctx.textBaseline = 'middle';
-    ctx.fillText(textL, x, cy + 0.5);
-    x += wL;
-
-    // Separator
-    x += gap / 2;
-    ctx.strokeStyle = style.separatorColor;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x + 0.5, style.paddingY);
-    ctx.lineTo(x + 0.5, cssHeight - style.paddingY);
-    ctx.stroke();
-    x += sep + gap / 2;
-
-    // Right dot + text
-    ctx.fillStyle = style.dumpDotColor;
-    ctx.beginPath();
-    ctx.arc(x + dot / 2, cy, dot / 2, 0, Math.PI * 2);
-    ctx.fill();
-    x += dot + gap;
-
-    ctx.fillStyle = style.textColor;
-    ctx.fillText(textD, x, cy + 0.5);
-
-    return { canvas, cssWidth, cssHeight };
-  }
-
-  private roundedRect(
-    ctx: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-    r: number,
-    fillStyle: string
-  ): void {
-    const radius = Math.min(r, w / 2, h / 2);
-    ctx.fillStyle = fillStyle;
-    ctx.beginPath();
-    ctx.moveTo(x + radius, y);
-    ctx.arcTo(x + w, y, x + w, y + h, radius);
-    ctx.arcTo(x + w, y + h, x, y + h, radius);
-    ctx.arcTo(x, y + h, x, y, radius);
-    ctx.arcTo(x, y, x + w, y, radius);
-    ctx.closePath();
-    ctx.fill();
-  }
+  };
 }
