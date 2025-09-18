@@ -1,1 +1,24 @@
-  subStates: ['Engine Stop', 'Long Idling', 'Medium Idling', 'Productive Idling', 'Short Idling', 'Working']
+// Text (already there)
+ctx.fillStyle = style.textColor;
+const tx = style.paddingX + dot + gap;
+ctx.fillText(texts[i], tx, y);
+
+// --- NEW: separator between rows (hr) when there are multiple rows ---
+if (rows.length > 1 && i < rows.length - 1) {
+  ctx.strokeStyle = style.separatorColor || '#000';
+  ctx.lineWidth = 1;
+
+  // draw a 1px line across the inner width, centered in the row gap
+  const innerLeft  = style.paddingX;
+  const innerRight = cssWidth - style.paddingX;
+  const yy = y + Math.floor(rowH / 2) + Math.floor(rowGap / 2);
+
+  ctx.beginPath();
+  ctx.moveTo(innerLeft + 0.5,  yy + 0.5);
+  ctx.lineTo(innerRight - 0.5, yy + 0.5);
+  ctx.stroke();
+}
+// --- END NEW ---
+
+y += rowH;
+if (i < rows.length - 1) y += rowGap;
