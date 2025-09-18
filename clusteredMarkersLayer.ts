@@ -44,6 +44,11 @@ export class ClusteredMarkersLayer {
   constructor(viewer: Viewer, data: MarkerData[], options?: ClusteredMarkersOptions) {
     this.viewer = viewer;
 
+    // Render at device pixel ratio (capped) to keep canvases & billboards crisp
+    try {
+      (this.viewer as any).resolutionScale = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    } catch {}
+
     const defaults: Required<ClusteredMarkersOptions> = {
       enabled: true,
       pixelRange: 200,
@@ -98,8 +103,9 @@ export class ClusteredMarkersLayer {
       cluster.billboard.show = true;
       cluster.billboard.image = out.canvas.toDataURL('image/png');
       cluster.billboard.verticalOrigin = VerticalOrigin.CENTER;
-      cluster.billboard.width = out.cssWidth;
-      cluster.billboard.height = out.cssHeight;
+      cluster.billboard.width = out.cssWidth | 0;   // ensure integers (crisp)
+      cluster.billboard.height = out.cssHeight | 0; // ensure integers (crisp)
+      cluster.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY;
 
       // unify picking & store members with a stable key
       const sharedId = cluster.label.id;
@@ -146,13 +152,16 @@ export class ClusteredMarkersLayer {
       if (!isFinite(lat) || !isFinite(lng)) continue;
       const position = Cartesian3.fromDegrees(lng, lat, 0);
 
+      const px = Math.max(1, Math.round(this.options.pointPixelSize));
+      const outlineW = Math.max(0, Math.round(2));
+
       const entity = this.dataSource.entities.add({
         position,
         point: {
-          pixelSize: this.options.pointPixelSize,
+          pixelSize: px,
           color: Color.fromCssColorString(marker.options.color),
           outlineColor: Color.WHITESMOKE,
-          outlineWidth: 2,
+          outlineWidth: outlineW,
         },
       });
 
@@ -302,70 +311,71 @@ export class ClusteredMarkersLayer {
     rows: Array<{ label: string; count: number; dotCss: string }>,
     style: ClusterBadgeStyle
   ): { canvas: HTMLCanvasElement; cssWidth: number; cssHeight: number } {
-    const ctxMeasure = document.createElement('canvas').getContext('2d')!;
-    ctxMeasure.font = `${style.fontPx}px`;
+    // Include font family in measurement for consistent metrics
+    const measure = document.createElement('canvas').getContext('2d')!;
+    measure.font = `${style.fontPx}px ${style.fontFamily}`;
 
-    const dot = style.dotDiameterPx;
-    const gap = style.dotGapPx;
-    const rowGap = style.rowGapPx;
+    const dot = Math.max(1, Math.round(style.dotDiameterPx));
+    const gap = Math.max(0, Math.round(style.dotGapPx));
+    const rowGap = Math.max(0, Math.round(style.rowGapPx));
+    const rowH = Math.max(1, Math.round(style.fontPx));
 
-    const texts = rows.map((r) => `${r.label} ${r.count}`);
-    const textWidths = texts.map((t) => ctxMeasure.measureText(t).width);
+    const texts = rows.map(r => `${r.label} ${r.count}`);
+    const textWidths = texts.map(t => measure.measureText(t).width);
 
-    // Width governed by the widest row: dot + gap + text
-    const contentWidth = Math.max(...textWidths.map((w) => dot + gap + w), 0);
-    // Height = N * rowHeight + gaps between rows
-    const rowHeight = style.fontPx; // text middle aligns within row
+    const contentW = texts.length ? Math.max(...textWidths.map(w => Math.ceil(w)), 0) : 0;
+    const contentWidth = (dot + gap) + contentW;
+
     const contentHeight = rows.length > 0
-      ? rows.length * rowHeight + (rows.length - 1) * rowGap
-      : rowHeight;
+      ? rows.length * rowH + (rows.length - 1) * rowGap
+      : rowH;
 
+    // CSS pixel size should be integer to avoid resampling
     const cssWidth = Math.ceil(contentWidth + style.paddingX * 2);
     const cssHeight = Math.ceil(contentHeight + style.paddingY * 2);
 
-    const dpr = this.dpi;
+    const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+
     const canvas = document.createElement('canvas');
     canvas.width = cssWidth * dpr;
     canvas.height = cssHeight * dpr;
 
-    const ctx = canvas.getContext('2d')!;
-    ctx.scale(dpr, dpr);
+    const ctx = canvas.getContext('2d', { alpha: true })!;
+    // Draw in device pixels; no fractional transforms
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Avoid image resampling artifacts
+    (ctx as any).imageSmoothingEnabled = false;
 
-    // Background rectangle (no rounded corners)
+    // Background (align to integer px in CSS space)
     ctx.fillStyle = style.backgroundColor;
-    ctx.fillRect(0.5, 0.5, cssWidth - 1, cssHeight - 1);
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
 
-    // 1px border
+    // Border at exact 1 CSS px
     ctx.strokeStyle = style.borderColor;
-    ctx.lineWidth = style.borderWidth;
+    ctx.lineWidth = Math.max(1, Math.round(style.borderWidth));
     ctx.strokeRect(0.5, 0.5, cssWidth - 1, cssHeight - 1);
 
-    ctx.font = `${style.fontPx}px`;
+    ctx.font = `${rowH}px ${style.fontFamily}`;
     ctx.textBaseline = 'middle';
     ctx.fillStyle = style.textColor;
 
-    let y = style.paddingY + rowHeight / 2;
-
+    let y = style.paddingY + Math.floor(rowH / 2);
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
+      const cx = style.paddingX + Math.floor(dot / 2);
 
-      // Dot (left side)
-      const cx = style.paddingX + dot / 2;
+      // Dot
       ctx.fillStyle = r.dotCss;
       ctx.beginPath();
       ctx.arc(cx, y, dot / 2, 0, Math.PI * 2);
       ctx.fill();
 
-      // Text
+      // Text (integer x)
       ctx.fillStyle = style.textColor;
-      ctx.fillText(texts[i], style.paddingX + dot + gap, y + 0.5);
+      const tx = style.paddingX + dot + gap;
+      ctx.fillText(texts[i], tx, y);
 
-      // 1px border
-      ctx.strokeStyle = style.borderColor;
-      ctx.lineWidth = style.borderWidth;
-      ctx.strokeRect(0.5, 0.5, cssWidth - 1, cssHeight - 1);
-
-      y += rowHeight;
+      y += rowH;
       if (i < rows.length - 1) y += rowGap;
     }
 
@@ -388,7 +398,6 @@ export class ClusteredMarkersLayer {
       }
 
       const entity = picked.id as Entity;
-      const now = JulianDate.now();
       const pos = picked.primitive?.position;
       if (!pos) {
         this.hidePopup();
@@ -469,6 +478,7 @@ export class ClusteredMarkersLayer {
 
   private ensurePopupEl(): void {
     if (this.popupEl) return;
+
     const el = document.createElement('div');
     el.className = 'cm-popup';
     Object.assign(el.style, {
@@ -478,7 +488,7 @@ export class ClusteredMarkersLayer {
       background: '#fff',
       color: '#111',
       padding: '10px 12px',
-      transform: 'translate(-50% -150%)',
+      transform: 'translate(-50%, -100%)', // anchor above tip
       borderRadius: '6px',
       boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
       pointerEvents: 'auto',
@@ -486,9 +496,36 @@ export class ClusteredMarkersLayer {
       fontSize: '12px',
       lineHeight: '1.4',
       border: '1px solid #e8e8e8',
+      willChange: 'left, top',
     } as CSSStyleDeclaration);
+
+    // arrow element (always present)
+    const arrow = document.createElement('div');
+    arrow.className = 'cm-arrow';
+    Object.assign(arrow.style, {
+      position: 'absolute',
+      left: '50%',
+      bottom: '-10px',
+      transform: 'translateX(-50%)',
+      width: '0',
+      height: '0',
+      borderLeft: '10px solid transparent',
+      borderRight: '10px solid transparent',
+      borderTop: '10px solid white',
+      pointerEvents: 'none',
+    } as CSSStyleDeclaration);
+
+    el.appendChild(arrow);
     this.viewer.container.appendChild(el);
     this.popupEl = el;
+  }
+
+  private setPopupContent(html: string): void {
+    if (!this.popupEl) return;
+    // keep the arrow as the last child intact
+    const arrow = this.popupEl.querySelector('.cm-arrow');
+    this.popupEl.innerHTML = `<div class="cm-body">${html}</div>`;
+    if (arrow) this.popupEl.appendChild(arrow);
   }
 
   private enablePopupTracking(): void {
@@ -514,24 +551,47 @@ export class ClusteredMarkersLayer {
     const now = JulianDate.now();
     const pos = (entity as any).position?.getValue?.(now);
     if (!pos) return;
-    const win = SceneTransforms.worldToWindowCoordinates(this.viewer.scene, pos);
+
+    const scene = this.viewer.scene;
+    const container = this.viewer.container;
+    const win = SceneTransforms.worldToWindowCoordinates(scene, pos);
     if (!win) return;
 
-    const pad = 12;
+    const arrowH = 10; // must match CSS (border-top)
+    const pad = 8;
+
     const el = this.popupEl;
-    const container = this.viewer.container;
 
-    let left = win.x + pad;
-    let top = win.y - pad;
+    // Ideal tip anchor (win.x, win.y)
+    let left = Math.round(win.x);
+    let top = Math.round(win.y - arrowH);
 
-    const maxLeft = container.clientWidth - el.offsetWidth - pad;
-    const maxTop = container.clientHeight - el.offsetHeight - pad;
+    // With translate(-50%, -100%), (left, top) is the tip location.
+    // Clamp the box within container.
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
 
-    left = Math.max(pad, Math.min(left, maxLeft));
-    top = Math.max(pad, Math.min(top, maxTop));
+    let elLeft = left - Math.round(width / 2);
+    let elTop = top - height;
 
-    el.style.left = `${left}px`;
-    el.style.top = `${top}px`;
+    const minLeft = pad;
+    const maxLeft = container.clientWidth - width - pad;
+    const minTop = pad;
+    const maxTop = container.clientHeight - height - pad;
+
+    elLeft = Math.max(minLeft, Math.min(elLeft, maxLeft));
+    elTop = Math.max(minTop, Math.min(elTop, maxTop));
+
+    el.style.left = `${elLeft + Math.round(width / 2)}px`;
+    el.style.top = `${elTop + height}px`;
+
+    // Slide the arrow horizontally so its tip remains at the screen x
+    const arrow = el.querySelector<HTMLDivElement>('.cm-arrow');
+    if (arrow) {
+      let arrowCenter = win.x - elLeft; // px within popup
+      arrowCenter = Math.max(12, Math.min(arrowCenter, width - 12));
+      arrow.style.left = `${Math.round(arrowCenter)}px`;
+    }
   }
 
   private showPopupAt(entity: Entity, html: string): void {
@@ -539,7 +599,7 @@ export class ClusteredMarkersLayer {
     if (!this.popupEl) return;
     this.carousel = undefined;
     this.popupAnchor = entity;
-    this.popupEl.innerHTML = html;
+    this.setPopupContent(html);
     this.popupEl.style.display = 'block';
     this.positionPopupAt(entity);
     this.enablePopupTracking();
@@ -559,24 +619,26 @@ export class ClusteredMarkersLayer {
     this.carousel = { entities, index: 0, anchor };
     this.popupAnchor = undefined;
 
-    this.popupEl.innerHTML = `
+    const html = `
       <div style="display:flex; align-items:center; gap:8px;">
-        <div class="cm-prev" title="Previous" style="border:1px solid #ddd; background:#f9f9f9; border-radius:50%; padding:6px 9px 0; cursor:pointer;width:40px;transform: translate(-25px, 10px);">
-            <span style="width:32px;font-size:30px;line-height:0.3;margin-left:2px">
-              &#8249; 
-            </span>
-          </div>
+        <button class="cm-prev" title="Previous" style="
+          display:flex;align-items:center;justify-content:center;
+          width:36px;height:36px;border:1px solid #ddd;background:#f9f9f9;
+          border-radius:50%; cursor:pointer; flex:0 0 36px;">
+          <span style="font-size:22px;line-height:1;">&#8249;</span>
+        </button>
         <div class="cm-content" style="flex:1; min-width:220px;"></div>
-        <div class="cm-next" title="Next" style="
-          border:1px solid #ddd; background:#f9f9f9; border-radius:50%; padding:6px 9px 0; cursor:pointer;width:40px;transform: translate(25px, 10px);">
-            <span style="width:32px;font-size:30px;line-height:0.3;margin-right:2px">
-              &#8250; 
-            </span>          </div>
-          <div style="position:absolute; bottom:-10px; left:50%; transform:translateX(-50%); width:0; height:0; border-left:10px solid transparent; border-right:10px solid transparent; border-top:10px solid white;"></div>
+        <button class="cm-next" title="Next" style="
+          display:flex;align-items:center;justify-content:center;
+          width:36px;height:36px;border:1px solid #ddd;background:#f9f9f9;
+          border-radius:50%; cursor:pointer; flex:0 0 36px;">
+          <span style="font-size:22px;line-height:1;">&#8250;</span>
+        </button>
       </div>
       <div class="cm-indicator" style="margin-top:6px; text-align:center; color:#666; font-weight:600;"></div>
-
     `;
+
+    this.setPopupContent(html);
     this.popupEl.style.display = 'block';
 
     const prevBtn = this.popupEl.querySelector<HTMLButtonElement>('.cm-prev')!;
@@ -621,8 +683,8 @@ export class ClusteredMarkersLayer {
 
     const content = this.popupEl.querySelector<HTMLDivElement>('.cm-content')!;
     const indicator = this.popupEl.querySelector<HTMLDivElement>('.cm-indicator')!;
-    content.innerHTML = html;
-    indicator.textContent = `${index + 1} / ${entities.length}`;
+    if (content) content.innerHTML = html;
+    if (indicator) indicator.textContent = `${index + 1} / ${entities.length}`;
 
     this.positionPopupAt(anchor);
   }
@@ -655,7 +717,7 @@ export class ClusteredMarkersLayer {
 
     return `
     <div>
-      <div style=margin-bottom:6px;">
+      <div style="margin-bottom:6px;">
         <div style="display:flex;align-items:center;gap:8px;">
           <img style="width:60px" src="/assets/images/asset-default.svg"/>
           <div>
