@@ -1,24 +1,15 @@
-// Text (already there)
-ctx.fillStyle = style.textColor;
-const tx = style.paddingX + dot + gap;
-ctx.fillText(texts[i], tx, y);
-
-// --- NEW: separator between rows (hr) when there are multiple rows ---
+// --- separator across full badge width + equal gap between rows ---
 if (rows.length > 1 && i < rows.length - 1) {
   ctx.strokeStyle = style.separatorColor || '#000';
   ctx.lineWidth = 1;
 
-  // draw a 1px line across the inner width, centered in the row gap
-  const innerLeft  = style.paddingX;
-  const innerRight = cssWidth - style.paddingX;
-  const yy = y + Math.floor(rowH / 2) + Math.floor(rowGap / 2);
+  // hr sits exactly in the middle of the vertical gap between rows
+  const hrY = y + Math.floor(rowH / 2) + Math.floor(rowGap / 2);
 
+  // draw full width (border to border), aligned to device pixel
   ctx.beginPath();
-  ctx.moveTo(innerLeft + 0.5,  yy + 0.5);
-  ctx.lineTo(innerRight - 0.5, yy + 0.5);
+  ctx.moveTo(0.5, hrY + 0.5);
+  ctx.lineTo(cssWidth - 0.5, hrY + 0.5);
   ctx.stroke();
 }
-// --- END NEW ---
-
-y += rowH;
-if (i < rows.length - 1) y += rowGap;
+// --- end separator ---
